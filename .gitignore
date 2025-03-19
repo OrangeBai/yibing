@@ -1,0 +1,8 @@
+.vscode/
+.idea/
+**/__pycache__
+**/token.txt
+**/config.ini
+**/csmar-log.log
+mypackage.egg-info/
+delta/external_packages/csmarapi/accounts.py

@@ -1,0 +1,2043 @@
+//******************************************************************************
+//	BHC level LCR
+//******************************************************************************
+clear
+set more off
+eststo clear
+
+*Zhuoli's file path
+/*
+global folder "C:\Users\zhuoli\Dropbox\KairongZhuoli"
+*/
+
+* Kairong's file path
+/*
+global folder "D:\Dropbox\MMF-FHLB-PROJECT\EMPIRICAL\data"
+global dropbox "D:\Dropbox\"
+*/
+cd "$folder\raw"
+
+//******************************************************************************
+// Create data that is not needed to sum (for replacing)
+//******************************************************************************
+{
+/*
+
+clear
+clear matrix
+set more off
+set maxvar 30000
+use "data_final.dta",clear
+
+*keep structure data which is collapsed in the last step
+*for example, it is meaningless to sum id number
+keep rssd9048 rcon9804 rssd9331 rssd9241 rssd9014 call8786 date rssd
+
+//merge for getting entity information
+rename rssd idrssd
+gen year=year(date)
+merge m:1 year idrssd using rssdid_entity
+keep if _merge == 3 // very small
+drop _merge
+
+// generate date
+order date entity, first
+
+// generate quarter
+gen quarter = qofd(date)
+format quarter %tq
+order quarter, first
+
+*rename for replacing
+foreach var of varlist _all{
+	local varname=substr("`var'",1,8)
+	g `varname'_replace=`var'
+	drop `var'
+}
+format quarter %tq
+format date_replace %td
+rename (quarter_replace date_replace entity_) (quarter date entity)
+
+//keep ID data
+keep rssd9048 rcon9804 rssd9331 rssd9241 rssd9014 call8786 quarter entity
+duplicates drop quarter entity,force
+
+*save structure data
+save "interim\data_bhc_intermediate_replace",replace
+*/
+}
+//******************************************************************************
+
+
+
+//******************************************************************************
+// Prepare intermediate file from raw data
+//******************************************************************************
+{
+/*
+clear
+set more off
+clear matrix
+clear mata
+set maxvar 30000
+use "$folder\raw\interim\data_afterkeep.dta",clear //see "code before bank bhc level data"
+
+cd "$folder\raw"
+
+// generate date
+order date, first
+
+// generate quarter
+gen quarter = qofd(date)
+format quarter %tq
+order quarter, first
+
+g idrssd=rssd
+
+// Collapse at "entity" level, and merge with FR-Y-9C data
+// Entity: equals to rssdhcr (rssd9001) if there's a BHC, equals to rssdid (idrssd) otherwise
+// rssdid_entity: created from data/raw/fdic_sod
+merge m:1 year idrssd using rssdid_entity
+keep if _merge == 3 // very small
+drop _merge
+
+//translate namehcr to number
+encode namehcr,gen(namehcr_code)
+order date idrssd quarter date entity namehcr_code, first
+
+*delete string variables
+ds, has(type string)
+drop `r(varlist)'
+
+// collapse everything in the call report at entity level
+gcollapse (sum) call8786-rcons571, by(quarter date entity namehcr_code) fast
+save temp, replace
+
+
+*/
+}
+//******************************************************************************
+
+
+
+//******************************************************************************
+// Calculate LCR and NSFR
+//******************************************************************************
+{
+use $folder\raw\temp, clear
+//replace structure data which is summed
+merge 1:1 entity quarter using "interim\data_bhc_intermediate_replace"
+keep if _merge==3
+drop _merge
+
+//use data not summed to replace, these data loose their effect when collapse
+//for example, the sum of identity number contains no information
+replace call8786=call8786_replace
+replace rcon9804=rcon9804_replace
+replace rssd9014=rssd9014_replace
+replace rssd9048=rssd9048_replace
+replace rssd9241=rssd9241_replace 
+replace rssd9331=rssd9331_replace 
+
+
+	*calculate LCR and NSFR, code based on the authors'
+	{
+	/* this is the new filter condition */
+    g charter_type=rssd9048
+    g report_type=rcon9804
+    g entity_type_cd=rssd9331
+    g est_type_cd=rssd9241
+    g conservatorship=rssd9014
+    g report_level_cd=call8786
+	
+	
+	* total asset;
+    g asset=max(0,rcfd2170,rcon2170)
+	
+	/* gross loan is total loan plus unearned income */
+	g gross_loan=max(0,max(rcfd2122,rcon2122),rcfd5369+rcfdb528,rcon5369+rconb528)
+	
+    * allowance for loan and lease losses
+    g alll=max(rcfd3123,rcon3123)
+	
+	g loan=gross_loan
+	
+    * total loan, net of allowance and reserve;
+    g net_loan=gross_loan+(-1)*alll
+	
+	* total liability is defined as rcfd2948;
+    * before 1984, use rcfd2950 and rcfd3200;
+    g liab=max(0,rcfd2948,rcon2948,rcfd2950+rcfd3200,rcon2950+rcfd3200)
+	
+    * total equity capital;
+    g equity=max(0,rcfd3210,rcon3210)
+
+    * total deposit;
+    //The authors use 
+	//g deposit=max(0, rcfd2200, rcon2200)
+	//However, this measure would make the deposit systematically lower
+	g deposit=rcon2200+rcfn2200
+
+	
+	
+	/* Filter conditions */
+	
+    keep if est_type_cd==1
+	egen charter_type_ok=anymatch(charter_type),values(200, 250, 300, 310, 320, 330, 340, 350)
+	keep if charter_type_ok
+	drop charter_type_ok
+	*report_level_cd hardly change over time
+	bysort entity: egen temp_report_level_cd=max(report_level_cd)
+    keep if temp_report_level_cd==1 | temp_report_level_cd==2
+	drop temp_report_level_cd
+	keep if report_type<99 & report_type>0
+	keep if entity_type_cd<38 & entity_type_cd>0
+	keep if conservatorship==0
+	
+	/*To ensure robustness against out-lier observations, we exclude all bank-quarters 
+	when total assets,total loans, total deposits, and total liabilities are either 
+	missing orbelow one million U.S. dollars.*/
+	keep if asset!=. & asset>1000
+	keep if gross_loan!=. & gross_loan>1000
+	keep if liab!=. & liab>1000
+	keep if deposit!=. & deposit>1000
+	
+	/* end : structure variable */
+	
+	
+	
+	
+    * step 2: construct balance sheet variables;
+    /* start: security*/
+
+    * trading securities, market value;
+    g trading_sec=max(0,max(rcfd3545, rcon3545),max(rcfd2146, rcon2146))
+
+    /* trading liabilities, market value, 1994-03-31 to 9999 */
+    g trading_liab=max(0,max(rcfd3548,rcon3548)) 
+
+    * investment portfolio securities, fair value;
+    g sec_fv=max(0,max(rcfd1771,rcon1771)+max(rcfd1773,rcon1773),max(rcfd0391,rcon0391))
+
+    g sec_bv=max(0,max(rcfd1754,rcon1754)+max(rcfd1772,rcon1772),max(rcfd0390,rcon0390))
+
+
+    * total securities, fair value;
+    g securities=sec_fv+ trading_sec
+
+    * government securities;
+    g gov_sec_bv=max(0, ///
+						max(rcfd0211, rcon0211)+ ///
+						max(rcfd1286, rcon1286)+ ///
+						max(rcfd1289, rcon1289)+ ///
+                        max(rcfd1291, rcon1291)+ ///
+                        max(rcfd1294, rcon1294)+ ///
+                        max(rcfd1297, rcon1297)+ ///
+                        max(rcfd8496, rcon8496)+ ///
+                        max(rcfd8498, rcon8498), ///    
+						/// /* 1959 to 1993 */
+						max(rcfd0400, rcon0400)+ ///
+                        max(rcfd0402, rcon0402)+ ///
+                        max(rcfd0600, rcon0600)) 
+
+    g gov_sec_fv=max(0, ///  /* after 1994 */
+						max(rcfd0213, rcon0213)+ ///
+                        max(rcfd1287, rcon1287)+ ///
+                        max(rcfd1290, rcon1290)+ ///
+                        max(rcfd1293, rcon1293)+ ///
+                        max(rcfd1295, rcon1295)+ ///
+                        max(rcfd1298, rcon1298)+ ///
+                        max(rcfd8497, rcon8497)+ ///
+                        max(rcfd8499, rcon8499), ///  
+						/// /* 1959 to 1993 */
+						max(rcfd0401, rcon0401)+ ///
+                        max(rcfd0403, rcon0403)+ ///
+                        max(rcfd0601, rcon0601)) 
+
+    g gse_mbs_bv=max(0, ///
+                        /* after 2009 */ /// 
+						max(rcfdg300, rcong300)+ ///
+                        max(rcfdg302, rcong302)+ ///
+                        max(rcfdg304, rcong304)+ ///
+                        max(rcfdg306, rcong306)+ ///
+                        max(rcfdg312, rcong312)+ ///
+                        max(rcfdg314, rcong314)+ ///
+                        max(rcfdg316, rcong316)+ ///
+                        max(rcfdg318, rcong318), ///
+					/// /* 1994 to 2008 */
+						max(rcfd1698, rcon1698)+ ///
+                        max(rcfd1701, rcon1701)+ ///
+                        max(rcfd1703, rcon1703)+ ///
+                        max(rcfd1706, rcon1706)+ ///
+                        max(rcfd1714, rcon1714)+ ///
+                        max(rcfd1716, rcon1716)+ ///
+                        max(rcfd1718, rcon1718)+ ///
+                        max(rcfd1731, rcon1731))
+
+    g gse_mbs_fv=max(0, ///
+                    /// /* after 2009 */
+						max(rcfdg301, rcong301)+ ///
+                        max(rcfdg303, rcong303)+ ///
+                        max(rcfdg305, rcong305)+ ///
+                        max(rcfdg307, rcong307)+ ///
+                        max(rcfdg313, rcong313)+ ///
+                        max(rcfdg315, rcong315)+ ///
+                        max(rcfdg317, rcong317)+ ///
+                        max(rcfdg319, rcong319), /// 
+					/// /* 1994 to 2008 */
+						max(rcfd1699, rcon1699)+ ///
+                        max(rcfd1702, rcon1702)+ ///
+                        max(rcfd1705, rcon1705)+ ///
+                        max(rcfd1707, rcon1707)+ ///
+                        max(rcfd1715, rcon1715)+ ///
+                        max(rcfd1717, rcon1717)+ ///
+                        max(rcfd1719, rcon1719)+ ///
+                        max(rcfd1732, rcon1732))
+
+    /* non-gse mbs */
+    g ngse_mbs_bv=max(0, ///
+                         /* after 2009 */ /// 
+						 max(rcfdg308, rcong308)+ ///
+                         max(rcfdg310, rcong310)+ ///
+                         max(rcfdg320, rcong320)+ ///
+                         max(rcfdg322, rcong322), ///
+					     /* 1994 to 2008 */ /// 
+						 max(rcfd1709, rcon1709)+ ///
+                         max(rcfd1711, rcon1711)+ ///
+                         max(rcfd1733, rcon1733)+ ///
+                         max(rcfd1735, rcon1735))
+
+    g ngse_mbs_fv=max(0, ///
+ ///                     /* after 2009 */
+						 max(rcfdg309, rcong309)+ ///
+                         max(rcfdg311, rcong311)+ ///
+                         max(rcfdg321, rcong321)+ ///
+                         max(rcfdg323, rcong323), /// 
+ /// 					 /* 1994 to 2008 */
+						 max(rcfd1710, rcon1710)+ ///
+                         max(rcfd1713, rcon1713)+ ///
+                         max(rcfd1734, rcon1734)+ ///
+                         max(rcfd1736, rcon1736))
+
+    /* abs only available after 2001 */
+    g abs_bv=max(rcfdc026, rconc026)+ max(rcfdc989, rconc989)
+    g abs_fv=max(rcfdc027, rconc027)+ max(rcfdc988, rconc988)
+
+
+    /* other debt securities only available after 1994*/
+    g other_sec_bv=   max(rcfd1737, rcon1737)+ ///
+                      max(rcfd1739, rcon1739)+ ///
+                      max(rcfd1742, rcon1742)+ ///
+                      max(rcfd1744, rcon1744)
+
+
+    g other_sec_fv=   max(rcfd1738, rcon1738)+ ///
+                      max(rcfd1741, rcon1741)+ ///
+                      max(rcfd1743, rcon1743)+ ///
+                      max(rcfd1746, rcon1746)
+
+    /* structured note only available after 1994 */
+    g struct_note_bv=max(0, rcfd8782, rcon8782)
+    g struct_note_fv=max(0, rcfd8783, rcon8783)
+
+    /* end: security*/	
+
+	
+    /* start: loan */
+
+
+    * loan secured by real estate;
+    g re_loan=max(0, ///
+                 /// /* 1959 to 2006 */
+                 max(rcfd1410,rcon1410), ///
+                 /// /* 2007 to 2010 */
+                 rcon1415+rcon1420+rcon1797+rcon5367+rcon5368+rcon1460+rcon1480, ///
+                 /// /* after 2011 */
+                 rconf158+rconf159+rcon1420+rcon1797+rcon5367+rcon5368+rcon1460+rconf160+rconf161) 
+
+    * commercial and industrial loan, this one seems to have less missing value;
+    * so we use two version to reduce the missing values;
+    g ci_loan=max(0, ///
+                  /// /* version 1 */
+                  max(rcfd1766, rcon1766), ///
+                  /// /* version 2 */
+                  max(rcfd1763, rcon1763)+max(rcfd1764, rcon1764))
+				  
+    * loan to individuals;
+    g cons_loan=max(0, ///
+                    /// /* 1959 to 2006 */
+                    max(rcfd1975, rcon1975), ///
+				    /// /* 2007 to 2010 */
+                    max(rcfdb538+rcfdb539+rcfd2011,rconb538+rconb539+rcon2011), /// 
+				    /// /* after 2011 */
+                    max(rcfdb538+rcfdb539+rcfdk137+rcfdk207,rconb538+rconb539+rconk137+rconk207))
+
+    * agricultural loan;
+    g agri_loan=max(0, max(rcfd1590, rcon1590))
+
+
+    * construction loan;
+    g const_loan=max(0, ///
+                     /// /* 1976 to 2007 */
+                     rcon1415, ///
+                     /// /* after 2008 */
+                     rconf158+rconf159)
+
+    * commercial real estate loan;
+    g cre_loan=max(0, /// 
+                   /// /* 1976 to 2007 */
+                   const_loan+max(rcfd1460, rcon1460)+max(rcfd1480,rcon1480), /// 
+                   /// /* after 2008 */
+                   const_loan+max(rcfd1460, rcon1460)+rconf160+rconf161)
+
+
+    /* adc loan only available after 1991 */
+    g adc_loan=max(0,rcfd2746,rcon2746)
+
+    * residential loan is the loan sececured by real estate minus commercial real estate loan;
+    g res_loan=max(0, ///
+                   /// /* 1976 to 1986 */
+                   rcon1430, ///
+                   /// /* 1987 to 1990 */
+                   rcon1797+rcon1798, ///
+                   /// /* after 1991 */
+                   rcon1797+rcon5367+rcon5368)
+
+    g lease=max(0, ///
+               /// /* 1973 to 2007 */
+               max(rcon2165,rcfd2182+rcfd2183), ///
+               /// /* after 2008 */
+               max(rcon2165,rconf162+rconf163,rcfdf162+rcfdf163))
+
+
+    /* end: loan */
+	
+    * tangible equity;
+    g intangible_asset=max(0, max(rcfd2143, rcon2143), max(rcfd3163+rcfd0426,rcon3163+rcon0426))
+    g tce= equity+ (-1)*intangible_asset
+    g tangible_asset=0+asset+(-1)*intangible_asset
+
+
+
+    * delinquency;	
+
+    g dpd30=max(0, /// 
+               /// /* 1982 to 2006 */
+               max(rcfd1406, rcon1406), ///
+               /// /* form 41 2006 to 2010 */
+               rcon2759+rcon3493+ rcon5398+ rconc236+ rconc238+ rcon3499+ rcon3502+ ///
+                   rconb834+ rcon1606+ rconb575+ rconb578+ rcon5389+ rcon5459+ rcon1226+ rcon3505, ///
+               /// /* form 41 after 2011 */
+               rconf172+ rconf173+ rcon3493+ rcon5398+ rconc236+ rconc238+ rcon3499+ ///
+                   rconf178+ rconf179+ rconb834+ rcon1606+ rconb575+ rconk213+ rconk216+ rcon5389+ ///
+                   rcon5459+ rcon1226+ rcon3505, ///
+               /// /* form 31, 2006 to 2010 */
+               rcon2759+ rcon3493+ rcon5398+ rconc236+ rconc238+ rcon3499+ rcon3502+ /// 
+                   rcfnb572+ rcfd5377+ rcfd5380+ rcfd1594+ rcfd1251+ rcfd1254+ rcfdb575+ rcfdb578+ /// 
+                   rcfd5389+ rcfd5459+ rcfd1257+ rcfd1271+ rcfd3505, ///
+               /// /* form 31, after 2011 */
+               rconf172+ rconf173+ rcon3493+ rcon5398+ rconc236+ rconc238+ rcon3499+ ///
+                   rconf178+ rconf179+ rcfnb572+ rcfd5377+ rcfd5380+ rcfd1594+ rcfd1251+ ///
+				   rcfd1254+ rcfdb575+ rcfdk213+ rcfdk216+ rcfd5389+ rcfd5459+ rcfdf166+ rcfdf169+ rcfd3505) 	
+	
+	
+    g dpd90=max(0, ///
+               /// /* 1982 to 2006 */
+               max(rcfd1407, rcon1407),  ///
+               /// /* form 41, 2007 to 2010 */
+               rcon2769+ rcon3494+ rcon5399+ rconc237+ rconc239+ rcon3500+ rcon3503+ ///
+                   rconb835+ rcon1607+ rconb576+ rconb579+ rcon5390+ rcon5460+ rcon1227+ rcon3506,  ///
+               /// /* form 41, after 2011 */
+               rconf174+ rconf175+ rcon3494+ rcon5399+ rconc237+ rconc239+ rcon3500+ ///
+                   rconf180+ rconf181+ rconb835+ rcon1607+ rconb576+ rconk214+ rconk217+rcon5390+ ///
+                   rcon5460+ rcon1227+ rcon3506,  ///
+               /// /* form 31, 2007 to 2010 */
+               rcon2769+ rcon3494+ rcon5399+ rconc237+ rconc239+ rcon3500+ rcon3503+  ///
+                   rcfnb573+ rcfd5378+ rcfd5381+ rcfd1597+ rcfd1252+ rcfd1255+ rcfdb576+ rcfdb579+  ///
+                   rcfd5390+ rcfd5460+ rcfd1258+ rcfd1272+ rcfd3506,  ///
+               /// /* form 31, after 2011 */
+               rconf174+ rconf175+ rcon3494+ rcon5399+ rconc237+ rconc239+ rcon3500+ ///
+                   rconf180+ rconf181+ rcfnb573+  ///
+                   rcfd5378+ rcfd5381+ rcfd1597+ rcfd1252+ rcfd1255+ rcfdb576+ rcfdk214+ ///
+                   rcfdk217+ rcfd5390+ rcfd5460+ rcfdf167+ rcfdf170+ rcfd3506)
+
+    g dpdna=max(0, ///
+               /// /* 1982 to 2006 */
+               max(rcfd1403, rcon1403),  ///
+               /// /* form 41, 2007 to 2010 */
+               rcon3492+ rcon3495+ rcon5400+ rconc229+ rconc230+ rcon3501+ rcon3504+ /// 
+                   rconb836+ rcon1608+ rconb577+ rconb580+ rcon5391+ rcon5461+ rcon1228+ rcon3507+ /// 
+               /// /* form 41, after 2011 */
+               rconf176+ rconf177+ rcon3495+ rcon5400+ rconc229+ rconc230+ rcon3501+ ///
+                   rconf182+ rconf183+ rconb836+ rcon1608+ rconb577+ rconk215+ rconk218+ rcon5391+ ///
+                   rcon5461+ rcon1228+ rcon3507,  ///
+               /// /* form 31, 2007 to 2010 */
+               rcon3492+ rcon3495+ rcon5400+ rconc229+ rconc230+ rcon3501+ rcon3504+ /// 
+                   rcfnb574+ rcfd5379+ rcfd5382+ rcfd1583+ rcfd1253+ rcfd1256+ rcfdb577+ rcfdb580+  ///
+                   rcfd5391+ rcfd5461+ rcfd1259+ rcfd1791+ rcfd3507,  ///
+               /// /* form 31, after 2011 */
+               rconf176+ rconf177+ rcon3495+ rcon5400+ rconc229+ rconc230+ rcon3501+ ///
+                   rconf182+ rconf183+ rcfnb574+  ///
+                   rcfd5379+ rcfd5382+ rcfd1583+ rcfd1253+ rcfd1256+ rcfdb577+ rcfdk215+ ///
+                   rcfdk218+ rcfd5391+ rcfd5461+ rcfdf168+ rcfdf171+ rcfd3507)
+	
+     * non-performing loan;
+     g npl=dpd90+ dpdna
+
+     * performing loan equals total loan less non-performing loan;
+     g perf_loan=loan+(-1)*npl
+
+     * other real esate owned;
+	 g oreo=max(0, rcfd2150, rcon2150)
+
+     * non-performaing asset equals non-performing loan plus oreo;
+     g npa=npl+ oreo
+
+     /* begin need to add to keep variables */
+     g npl_const=max(0, ///
+                   max(rconf174+ rconf176+ rconf175+ rconf177,  ///
+			           rcon2769+ rcon3492))
+
+     g npl_farm=max(0, rcon3494+ rcon3495)
+
+     g npl_res_sf_he=max(0, rcon5399+ rcon5400)
+
+     g npl_res_sf=max(0,max(rconc237+rconc229+rconc239+rconc230,rcon5402+rcon5403))
+
+     g npl_res_mf=max(0,rcon3500+rcon3501)
+
+     g npl_res=npl_res_sf_he+npl_res_sf+npl_res_mf
+
+     g npl_nonfarm=max(0, max(rconf180+rconf182+rconf181+rconf183, rcon3503+rcon3504))
+
+     g npl_fn_re=max(0, rcfnb573+ rcfnb574)
+
+     g npl_re=max(0, ///
+                npl_const+ npl_farm+ npl_res+ npl_nonfarm+ npl_fn_re, ///
+                max(rcfd1422,  rcon1422)+ max(rcfd1423, rcon1423), ///
+		        max(rcon1246, rcfd1246)+ max(rcon1247, rcfd1247)+ max(rcon1249, rcfd1249)+ max(rcon1250, rcfd1250))
+
+     g npl_bank=max(0, ///
+                  max(rcon5378, rcfd5378)+ max(rcon5379, rcfd5379)+ max(rcon5381, rcfd5381)+ max(rcon5382, rcfd5382)  /// 
+			      ,rconb835+rconb836) 
+
+     g npl_agri=max(0, max(rcon1597, rcfd1597)+ max(rcon1583, rcfd1583))
+
+     g npl_ci=max(0, ///
+                max(max(rcon1252, rcfd1252)+  ///
+                        max(rcon1253, rcfd1253)+ ///
+                        max(rcon1255, rcfd1255)+  ///
+                        max(rcon1256, rcfd1256),   ///
+			        max(rcon1607, rcfd1607)+max(rcon1608, rcfd1608)))
+
+     g npl_cons=max(0, ///
+	              max(rcfdb576, rconb576)+ max(rcfdb577, rconb577)+ ///
+                      max(rcfdk214, rconk214)+ max(rcfdk215, rconk215)+ ///
+				      max(rcfdk217, rconk217)+ max(rcfdk218, rconk218), ///
+				  max(rcfdb576, rconb576)+ max(rcfdb577, rconb577)+ ///
+				      max(rcfdb579, rconb579)+ max(rcfdb580, rconb580), ///
+                  max(rcon1979, rcfd1979)+max(rcon1981, rcfd1981), ///   
+			      max(rcon5384, rcfd5384)+max(rcon5385, rcfd5385)+max(rcon5387, rcfd5387)+max(rcon5388, rcfd5388))
+
+     g npl_fn_gov=max(0, max(rcon5390, rcfd5390)+max(rcon5391, rcfd5391))  
+
+     g npl_other=max(0,max(rcon5460, rcfd5460)+max(rcon5461, rcfd5461))   
+
+     g npl_lease=max(0, ///
+                 max(rconf167, rcfdf167)+max(rconf168, rcfdf168)+rcfdf170+rcfdf171, ///
+			     max(rcon1227, rcfd1227)+max(rcon1228, rcfd1228), ///
+				 max(rcon1258, rcfd1258)+max(rcon1259, rcfd1259)+max(rcon1271, rcfd1271)+max(rcon1791, rcfd1791))
+
+     g npl_sec=max(0,max(rcon3506, rcfd3506)+max(rcon3507, rcfd3507))
+
+     g npl_adc=max(0,max(rcon6559, rcfd6559)+max(rcon6560, rcfd6560))
+
+
+     /* end need to add to keep variables */	
+
+     /* start: repo */
+     * repo is on liability side: borrowing;
+     * reverse repo is on asset side: lending
+     * fed fund sold is reverse repo;
+     * fed fund purchase is repo;
+     * data is missing between 1997 and 2003;
+
+     g rev_repo_ffund=max(rconb987, rcfdb987)+max(rcon0276, rcfd0276)
+     g rev_repo_sec=max(rcfdb989, rconb989)+ max(rcon0277, rcfd0277)
+     g rev_repo=max(rev_repo_ffund+rev_repo_sec, max(rcfd1350, rcon1350))
+
+     g repo_ffund=max(rconb993, rcfdb993)+ max(rcon0278, rcfd0278)
+     g repo_sec=max(rcfdb995, rconb995)+ max(rcon0279, rcfd0279)
+     g repo=max(repo_ffund+repo_sec, max(rcfd2800,rcon2800))
+
+
+     * securities borrowed is on asset side: lending;
+     * securities lent is on liabilities side: borrowing;
+
+     g sec_borrowed=max(rcfd3432, rcon3432)
+     g sec_lent=max(rcfd3433, rcon3433)
+
+     /* end: repo */
+
+
+
+     /* start: deposit */
+     * deposit all use rcon fields;
+
+     * demand  deposit;
+     g demand_deposit=rcon2210
+
+     * transaction deposit;
+     * note: transactioin deposit include demand deposit;
+     g trans_deposit=rcon2215
+
+     * non-transactions deposit, this include all time deposit, plus money market deposit;
+     g ntrans_deposit=rcon2385
+
+     * money market deposit;
+     g mmda=rcon6810
+
+     * other saving deposit;
+     g other_saving_deposit=rcon0352
+
+     * saving deposit;
+     g saving_deposit=mmda+other_saving_deposit
+
+     * term deposit or time deposit is non-transaction deposit minus saving deposit;
+     g time_deposit=ntrans_deposit+(-1)*saving_deposit
+
+     /* uninsured deposit 1993-03-31 to 9999 */
+     g uninsured_deposit=rcon5597
+
+     g insured_deposit=deposit+(-1)*uninsured_deposit
+
+     * amount of deposit > $100k;
+     * rcon2710 was replaced by rconf051 after 03/2006;
+     g deposit_ge100k=max(rcon2710, rconf051)
+
+     * time deposit < $100k;
+     g tdlt100k=rcon6648
+
+     * time deposit > $100k;
+     g tdge100k=rcon2604 
+
+     * time deposit <$250k;
+     * after oct 2008, deposit insurance change to $250k;
+     g tdge250k=rconj474 
+
+     * only available after 1997;
+     g tdlt100k_3mp=rcona579 
+     g tdlt100k_1yp=rcona579+rcona580
+
+     g tdlt100k_1y=rcona241 
+
+     * only available after 1997;
+     g tdge100k_3mp=rcona584
+     g tdge100k_1yp=rcona584+rcona587
+
+     g tdge100k_1y=max(rcona242,rconk221+rconk222)
+     g tdge250k_1y=rconk222
+     g time_deposit_1y= tdlt100k_1y+tdge100k_1y
+
+     * core deposit;
+     g core_deposit=trans_deposit+ mmda+ tdlt100k
+
+     * non maturity deposit;
+     g nmd=trans_deposit+ saving_deposit
+
+     g trans_deposit_ipb=rconb549
+     g trans_deposit_dgov=rcon2202
+     g trans_deposit_sgov=rcon2203
+     g trans_deposit_dbank=rconb551
+     g trans_deposit_fbank=rcon2213
+     g trans_deposit_fgov=rcon2216
+
+     g ntrans_deposit_ipb=rconb550 
+     g ntrans_deposit_dgov=rcon2520 
+     g ntrans_deposit_sgov=rcon2530
+     g ntrans_deposit_dbank=rconb552 
+     g ntrans_deposit_fbank=rcon2236
+     g ntrans_deposit_fgov=rcon2377 
+
+     g fn_deposit_ipb=rcfnb553
+     g fn_deposit_dbank=rcfnb554 
+     g fn_deposit_fbank=rcfn2625 
+     g fn_deposit_fgov=rcfn2650 
+     g fn_deposit_dgov=rcfnb555 
+     g fn_deposit=rcfn2200
+     g fn_time_deposit_1y=rcfna245 
+
+     * brokered deposit;
+     g brokered_deposit=rcon2365
+
+     g insured_bd_lt100k=rcon2343 
+     g insured_bd_ge100k=max(rcon2344, rconj472)
+     g insured_bd=insured_bd_lt100k+insured_bd_ge100k
+
+     g bd_lt100k_1y=rcona243 
+     g bd_ge100k_1y=rcona244
+     g bd_ge250k_1y=rconk220
+     g bd_1y=bd_lt100k_1y+ bd_ge100k_1y	
+
+
+     * deposit insurance limit change to 250k after october 2008;
+     * deposit insurance coverage limits: 1980 - october 2008: $100,000;
+     * october 2008 to present: $250,000;
+     * the change was temporat in 2008 but became permanent after the financial reform;
+	 g time_deposit_large=tdge100k
+	 g time_deposit_large_1y=tdge100k_1y
+	 g bd_large_1y=bd_ge100k_1y
+	  
+     replace time_deposit_large=tdge250k if date>=td(31oct2008)
+     replace time_deposit_large_1y=tdge250k_1y if date>=td(31oct2008)
+     replace bd_large_1y=bd_ge250k_1y if date>=td(31oct2008)
+
+
+     g time_deposit_small=time_deposit+(-1)*time_deposit_large
+     g time_deposit_small_1y=time_deposit_1y+(-1)*time_deposit_large_1y
+     g bd_small_1y=bd_1y+(-1)*bd_large_1y
+
+     g pref_deposit=rcon5590
+
+     g ira_deposit=rcon6835
+     g ira_deposit_ge100k=rconf233
+
+
+     /* end: deposit */	
+	
+	
+     /* start: other borrowed money */
+
+     * other borrowed money;
+
+     g fhlb_advance=max(0, ///
+					max(rconf055, rcfdf055)+max(rconf056, rcfdf056)+max(rconf057, rcfdf057)+max(rconf058, rcfdf058), ///
+				    max(rcon2651, rcfd2651)+max(rconb565, rcfdb565)+max(rconb566, rcfdb566))
+
+     * g fhlb_advance_1y=max(0, max(rconf055, rcfdf055)+max(rconf056, rcfdf056),max(rcon2651, rcfd2651))
+	 * Daheng:
+	 g fhlb_advance_1y=max(0, max(rconf055, rcfdf055),max(rcon2651, rcfd2651))
+
+     g other_bm=max(rcfd3190, rcon3190)+max(rcfd2850, rcon2850)
+
+     g other_bm_1y=.25*fhlb_advance_1y+max( max(rconf060,rcfdf060)+max(rconf061,rcfdf061), ///
+										max(rconb571, rcfdb571), max(rcon2332, rcfd2332))
+
+	 g sub_debt=rcfd3200
+
+
+     /* end: other borrowed money */
+
+
+     /* start: liquidity */
+
+     * short-term liabilities and short-term asset;
+
+     * subordinated note, this date is not good because it only span 1990-1996;
+     g subnote_1y=rcon3780
+
+     g sec_3mp=rcona549+rcona555+rcon0343
+     g sec_1yp=rcona549+rcona550+rcona555+rcona556+rcon0343+rcon0344
+
+     g sec_1y=rcona248+rcon0343+rcon0344
+
+     g res_loan_3mp=rcona564
+     g res_loan_1yp=rcona564+rcona565
+
+     g other_loan_3mp=rcona570
+     g other_loan_1yp=rcona570+rcona571
+
+     g loan_3mp=res_loan_3mp+ other_loan_3mp+ rcon0348
+     g loan_1yp=res_loan_1yp+ other_loan_1yp+ rcon0348+ rcon0349
+     g loan_1y=rcona247+ rcon0348+ rcon0349
+
+
+     * other liabilities;
+     * we assume it is short-term liability;
+     g other_liab=max(rcfd2930, rcon2930)
+
+     * short-term liabilities; 
+     g stl=repo+ saving_deposit+ time_deposit_1y+ other_bm_1y+ other_liab
+
+     * short-term investment;
+     g sti=rev_repo+ max(rcfd0010, rcon0010)
+
+     * short-term asset;
+     g sta=sti+ sec_1y+ loan_1y
+
+     g pledged_sec=max(rcfd0416, rcon0416)
+
+     * 12: net liquid asset;
+     g nla= sti+ sec_fv+ (-1)*repo+ (-1)*pledged_sec+ (-1)*other_liab
+
+     * net short-term-asset ;
+     g nsta=sta+ (-1)*stl
+
+     * non-core liability;
+     g ncl=repo+ other_bm+ brokered_deposit
+
+     * unused commitments;
+     * unused commitments for commercial real estate;
+     * available after 31mar1991;
+     g uc=max( ///
+			 max(rcon3814,rcfd3814)+max(rcon3815,rcfd3815)+max(rcon3817,rcfd3817)+ ///
+				max(rconf164,rcfdf164)+max(rconf165,rcfdf165)+ ///
+				max(rconj457,rcfdj457)+max(rconj458,rcfdj458)+max(rconj459,rcfdj459)+ ///
+				max(rcon6550,rcfd6550), ///
+			 max(rcon3814,rcfd3814)+max(rcon3815,rcfd3815)+max(rcon3816,rcfd3816)+ ///
+				max(rcon3817,rcfd3817)+max(rcon3818,rcfd3818)+max(rcon6550,rcfd6550) ///
+			)
+     g uc_he=max(rcfd3814, rcon3814)
+     g uc_ccard=max(rcfd3815, rcon3815)
+     g uc_cre=max(rcfd6550, rcon6550)+max(max(rcfd3816, rcon3816),max(rcfdf164, rconf164)+max(rcfdf165, rconf165))
+     g uc_sec_uw=max(rcfd3817, rcon3817)
+     *in the code from the authors, uc_other is covered by the 2nd uc_other
+	 g uc_other=max(rcfd3818, rcon3818)+max(rcfdj457, rconj457)+max(rcfdj458, rconj458)+max(rcfdj459, rconj459)
+	 g uc_cons=uc_he+uc_ccard
+     //g uc_other=uc+(-1)*uc_he+(-1)*uc_ccard+(-1)*uc_cre+(-1)*uc_sec_uw
+
+     * letter of credit;s
+     g lc=max(rcfd3819, rcon3819)+max(rcfd3821, rcon3821)+max(rcfd3411, rcon3411)
+
+
+	 * cds_bv cds_sold_bv include all credit derivatives;
+	 * cds_bv2 cds_sold_bv2 include only CDS and start in 2006;
+	 g cds_sold_bv=max(0, rconc968+ rconc970+ rconc972+ rconc974, rcona534, rcfdc968+rcfdc970+rcfdc972+rcfdc974, rcfda534)
+	 g cds_bv=max(0, rconc969+ rconc971+ rconc973+rconc975, rcona535, rcfdc969+rcfdc971+rcfdc973+rcfdc975, rcfda535)
+
+	 g cds_sold_bv2=max(0, rconc968, rcfdc968)
+	 g cds_bv2=max(0, rconc969, rcfdc969)
+
+	 g cds_sold_pos_fv=rconc219+rcfdc219
+	 g cds_sold_neg_fv=rconc220+rcfdc220
+	 g cds_pos_fv=rconc221+rcfdc221
+	 g cds_neg_fv=rconc222+rcfdc222
+
+
+	 g deri_int_trd_bv=max(0, rcfda126, rcona126)
+	 g deri_int_ntrd_bv=max(0, rcfd8725, rcon8725)
+	 g deri_fx_trd_bv=max(0, rcfda127, rcona127)
+	 g deri_fx_ntrd_bv=max(0, rcfd8726, rcon8726)
+	 g deri_eq_trd_bv=max(0, rcfd8723, rcon8723)
+	 g deri_eq_ntrd_bv=max(0, rcfd8727, rcon8727)
+	 g deri_cmd_trd_bv=max(0, rcfd8724, rcon8724)
+	 g deri_cmd_ntrd_bv=max(0, rcfd8728, rcon8728)
+
+
+     /* start: securitization and asset sales */
+      * securitized loan data are only available after 2001;
+
+     g sz_res_loan=max(rcfdb705, rconb705)+max(rcfdb706, rconb706)
+
+     g sz_cons_loan=max(rcfdb707, rconb707)+max(rcfdb708, rconb708)+max(rcfdb709, rconb709)
+
+     g sz_ci_loan=max(rcfdb710, rconb710)+max(rcfdb711, rconb711)
+
+     g sz_loan=sz_res_loan+sz_cons_loan+sz_ci_loan
+
+     g sz_res_expo=max(rcfdb712, rconb712)+max(rcfdb713, rconb713)+ ///
+				max(rcfdc393, rconc393)+max(rcfdc394, rconc394)+max(rcfdc400, rconc400)+ ///
+                max(rcfdc401, rconc401)+max(rcfdb776, rconb776)+max(rcfdb777, rconb777)
+
+     g sz_cons_expo=max(rcfdb714, rconb714)+max(rcfdb715, rconb715)+ ///
+                max(rcfdb716, rconb716)+max(rcfdc395, rconc395)+max(rcfdc396, rconc396)+ ///
+                max(rcfdc397, rconc397)+max(rcfdc402, rconc402)+max(rcfdc403, rconc403)+ ///
+                max(rcfdc404, rconc404)+max(rcfdb778, rconb778)+max(rcfdb779, rconb779)+max(rcfdb780, rconb780)
+
+     g sz_ci_expo=max(rcfdb717, rconb717)+max(rcfdb718, rconb718)+ ///
+                max(rcfdc398, rconc398)+max(rcfdc399, rconc399)+max(rcfdc405, rconc405)+ ///
+                max(rcfdc406, rconc406)+max(rcfdb781, rconb781)+max(rcfdb782, rconb782)
+
+     g sz_expo=sz_res_expo+sz_cons_expo+ sz_ci_expo
+
+     g sz_res_uc=max(rcfdb726, rconb726)+max(rcfdb727, rconb727)+max(rcfdb783, rconb783)+max(rcfdb784, rconb784)
+
+     g sz_cons_uc=max(rcfdb728, rconb728)+max(rcfdb729, rconb729)+ ///
+               max(rcfdb730, rconb730)+max(rcfdb785, rconb785)+max(rcfdb786, rconb786)+max(rcfdb787, rconb787)
+
+     g sz_ci_uc=max(rcfdb731, rconb731)+max(rcfdb732, rconb732)+max(rcfdb788, rconb788)+max(rcfdb789, rconb789)
+
+     g sz_uc=sz_res_uc+ sz_cons_uc+ sz_ci_uc
+
+     g sz_res_npl=max(rcfdb740, rconb740)+max(rcfdb741, rconb741)
+
+     g sz_cons_npl=max(rcfdb742, rconb742)+max(rcfdb743, rconb743)+max(rcfdb744, rconb744)
+
+     g sz_ci_npl=max(rcfdb745, rconb745)+max(rcfdb746, rconb746)
+               
+     g sz_npl=sz_res_npl+ sz_cons_npl+ sz_ci_npl
+
+     g as_res_loan=max(rcfdb790, rconb790)+max(rcfdb791, rconb791)
+                  
+     g as_cons_loan=max(rcfdb792, rconb792)+max(rcfdb793, rconb793)+max(rcfdb794, rconb794)
+                  
+     g as_ci_loan=max(rcfdb795, rconb795)+max(rcfdb796, rconb796)
+                  
+     g asset_sold=as_res_loan+as_cons_loan+ as_ci_loan
+
+     g as_res_expo=max(rcfdb797, rconb797)+max(rcfdb798, rconb798)
+                
+     g as_cons_expo=max(rcfdb799, rconb799)+max(rcfdb800, rconb800)+max(rcfdb801, rconb801)
+                
+     g as_ci_expo=max(rcfdb802, rconb802)+max(rcfdb803, rconb803)
+                
+     g as_expo= as_res_expo+ as_cons_expo+ as_ci_expo
+
+     g abcp_expo=max(rcfdb806, rconb806)+max(rcfdb807, rconb807)
+                 
+     g abcp_uc=max(rcfdb808, rconb808)+max(rcfdb809, rconb809)
+
+     /* end: securitization and asset sales */	
+
+     /* start: level 1 2 3 asset */
+     * reported in fair value;
+     * l2 l3 are the prefix for every item;
+     * not sure if we should mutually exclude rcfdf241 and rcfdg476;
+
+     g l2_sec=max(rcfdf241, rconf241)+ max(rcfdg476, rcong476)
+     g l3_sec=max(rcfdf242, rconf242)+ max(rcfdg477, rcong477)
+     g l2_loan=max(rcfdf244, rconf244)+ max(rcfdg486, rcong486)+ max(rcfdg491, rcong491)
+     g l3_loan=max(rcfdf245, rconf245)+ max(rcfdg487, rcong487)+ max(rcfdg492, rcong492)
+     g l2_trade_asset=max(rcfdf247, rconf247)+ max(rcfdg495, rcong495)+ max(rcfdg500, rcong500)
+     g l3_trade_asset=max(rcfdf248, rconf248)+ max(rcfdg496, rcong496)+ max(rcfdg501, rcong501)
+     g l2_other_asset=max(rcfdf250, rconf250)+ max(rcfdg396, rcong396)
+     g l3_other_asset=max(rcfdf251, rconf251)+ max(rcfdg804, rcong804)
+     g l2_deposit=max(rcfdf253, rconf253)
+     g l3_deposit=max(rcfdf254, rconf254)
+     g l2_trade_liab=max(rcfdf256, rconf256)+ max(rcfdg514, rcong514)+ max(rcfdg519, rcong519)
+     g l3_trade_liab=max(rcfdf257, rconf257)+ max(rcfdg515, rcong515)+ max(rcfdg520, rcong520)
+     g l2_other_liab=max(rcfdf259, rconf259)+ max(rcfdg808, rcong808)
+     g l3_other_liab=max(rcfdf260, rconf260)+ max(rcfdg809, rcong809)
+     g l2_uc=max(rcfdf262, rconf262)
+     g l2_rev_repo_ffund=max(rcfdg481, rcong481)
+     g l2_asset=max(rcfdg505, rcong505)
+     g l3_asset=max(rcfdg506, rcong506)
+     g l2_liab=max(rcfdg534, rcong534)
+     g l3_liab=max(rcfdg535, rcong535)
+
+     /* end: level 1 2 3 asset */	
+
+
+
+     /* regulatory capital */
+
+	 egen aa_cet1=max(rcfap859)
+	 g cet1=max(rcfap859, rcoap859)
+
+     egen aa_rwa=max(rcfwa223)
+     g rwa=max(max(rcfda223, rcona223), max(rcfaa223, rcoaa223))
+
+     egen aa_rbc=max(rcfw3792)
+     g rbc=max(max(rcfd3792, rcon3792), max(rcfa3792, rcoa3792))
+
+     g t1_capital=max(max(rcfd8274, rcon8274), max(rcfa8274, rcoa8274))
+
+     egen aa_t2_capital=max(rcfw5311)
+     g t2_capital=max(max(rcfd5311, rcon5311), max(rcfa5311, rcoa5311))
+
+	 /*
+	 aa_cet1_r=max(rcfap793, rcfwp793);
+	 cet1_r=max(rcfap793,  rcoap793);
+
+	 aa_rbcr=max(rcfw7205);
+     rbcr=max(max(rcfd7205, rcon7205), max(rcfa7205, rcoa7205));
+
+	 aa_t1_rbcr=max(rcfw7206);
+     t1_rbcr=max(max(rcfd7206, rcon7206), max(rcfa7206, rcoa7206));
+
+	 aa_sup_lr=max(rcfah036);
+
+     t1_lr=max(max(rcfd7204, rcon7204), rcfa7204, rcoa7204);
+     */
+
+     /* start: risk weighted asset */
+     g rw_cash=max(max(rcfd0010, rcon0010), max(rcfdd957, rcond957))
+
+     g rw_sec_htm=max(max(rcfd1754, rcon1754), max(rcfdd961, rcond961))
+     g rw_sec_afs=max(max(rcfd1773, rcon1773), max(rcfdd966, rcond966))
+
+     g rw_rev_repo=max(max(rcfdc225, rconc225), rcond971+rcfdh171)
+
+     g rw_loan=max(max(rcfd5369, rcon5369)+ max(rcfdb528, rconb528), ///
+                  rcfds413+ rcfds419+rcfds423+ rcfds431+ rcfds439+ rcfds445+ rcfds449+ rcfds457, ///
+                  rcons413+ rcons419+rcfds423+ rcons431+ rcons439+ rcons445+ rcons449+ rcons457)
+
+     g rw_alll=max(0,rcfd3123,rcon3123)
+
+     g rw_trade_asset=max(max(rcfd3545, rcon3545),max(rcfdd976, rcond976))
+	 
+     g rw_other_asset=max(max(rcfdb639, rconb639),max(rcfdd981, rcond981))
+
+     g rw_asset=max(0, max(rcfd2170, rcon2170))
+
+     g rw00_cash=max(max(rcfdb600, rconb600), rcfdd958, rcond958)
+     g rw20_cash=max(max(rcfdb601, rconb601), rcfdd959, rcond959)
+     g rw100_cash=max(max(rcfdb602, rconb602), rcfds397+rcfdd960, rcons397+rcond960)
+
+     g rw00_sec_htm=max(max(rcfdb604, rconb604), rcfdd962, rcond962)
+     g rw20_sec_htm=max(max(rcfdb605, rconb605), rcfdd963, rcond963)
+     g rw50_sec_htm=max(max(rcfdb606, rconb606), rcfdd964, rcond964)
+     g rw100_sec_htm=max(max(rcfdb607, rconb607), rcfdd965, rcond965)
+
+     g rw00_sec_afs=max(max(rcfdb609, rconb609), rcfdd967, rcond967)
+     g rw20_sec_afs=max(max(rcfdb610, rconb610), rcfdd968, rcond968)
+     g rw50_sec_afs=max(max(rcfdb611, rconb611), rcfdd969, rcond969)
+     g rw100_sec_afs=max(max(rcfdb612, rconb612), rcfdd970, rcond970)
+
+     *g rw00_rev_repo=max(max(rcfdc063, rconc063), rcond972)
+     *g rw20_rev_repo=max(max(rcfdc064, rconc064), rcond973)
+	 g rw00_rev_repo=max(max(rcfdc063, rconc063), rcond972)+2/3*rcfdh171 // fix the reverse repo change in 2015
+     g rw20_rev_repo=max(max(rcfdc064, rconc064), rcond973)+1/3*rcfdh171 // fix the reverse repo change in 2015
+     g rw100_rev_repo=max(max(rcfdb520, rconb520), rcons410+ rcond974)
+
+     g rw00_loan=max(max(rcfdb618,rconb618)+max(rcfdb623, rconb623), ///
+                   rcfdh173+rcfdh174+ rcfds425+ rcfds433+ rcfdh178+ rcfdh179+ rcfds451+ rcfds459, ///
+                   rconh173+rconh174+ rcons425+ rcons433+ rconh178+ rconh179+ rcons451+ rcons459)
+
+     g rw20_loan=max(max(rcfdb619, rconb619)+max(rcfdb624, rconb624), ///
+                   rcfds415+ rcfdh175+ rcfds426+ rcfds434+ rcfds441+ rcfdh180+ rcfds452+ rcfds460, ///
+                   rcons415+ rconh175+ rcons426+ rcons434+ rcons441+ rconh180+ rcons452+rcons460)
+
+     g rw50_loan=max(max(rcfdb620, rconb620)+max(rcfdb625, rconb625), ///
+                   rcfds416+ rcfdh176+ rcfds427+ rcfds435+ rcfds442+ rcfdh181+ rcfds453+ rcfds461, ///
+                   rcons416+ rconh176+ rcons427+ rcons435+ rcons442+ rconh181+ rcons453+ rcons461)
+
+     g rw100_loan=max( max(rcfdb621, rconb621)+max(rcfdb626, rconb626), ///
+                   rcfds417+ rcfdh177+ rcfds428+ rcfds436+ rcfds443+ rcfdh182+ rcfds454+ rcfds462, ///
+                   rcons417+ rconh177+ rcons428+ rcons436+ rcons443+ rconh182+ rcons454+ rcons462)
+
+     g rw00_trade_asset=max(max(rcfdb628, rconb628),rcfdd977, rcond977)
+     g rw20_trade_asset=max(max(rcfdb629, rconb629),rcfdd978, rcond978)
+     g rw50_trade_asset=max(max(rcfdb630, rconb630),rcfdd979, rcond979)
+     g rw100_trade_asset=max(max(rcfdb631, rconb631),rcfdd980, rcond989)
+
+     g rw00_other_asset=max(max(rcfdb641, rconb641), rcfdd982, rcond982)
+     g rw20_other_asset=max(max(rcfdb642, rconb642), rcfdd983, rcond983)
+     g rw50_other_asset=max(max(rcfdb643, rconb643), rcfdd984, rcond984)
+     g rw100_other_asset=max(max(rcfd5339, rcon5339), rcfdd985, rcond985)
+
+     g rw00_asset=max(max(rcfd5320, rcon5320), rcfdd987, rcond987)
+     g rw20_asset=max(max(rcfd5327, rcon5327), rcfdd988, rcond988)
+     g rw50_asset=max(max(rcfd5334, rcon5334), rcfdd989, rcond989)
+     g rw100_asset=max(max(rcfd5340, rcon5340), rcfdd990, rcond990)
+
+
+     * na is face value or notional amount;
+     * ea is credit equivalent amount;
+     g rw_na_lc_fin=max(max(rcfdb546, rconb546), rcfdd991, rcond991)
+
+     g rw_ea_lc_fin=max(max(rcfdb547, rconb547), rcfdd992, rcond992)
+
+     g rw00_lc_fin=max(max(rcfdb548, rconb548), rcfdd993, rcond993)
+     g rw20_lc_fin=max(max(rcfdb581, rconb581), rcfdd994, rcond994)
+     g rw50_lc_fin=max(max(rcfdb582, rconb582), rcfdd995, rcond995)
+     g rw100_lc_fin=max(max(rcfdb583, rconb583), rcfdd996, rcond996)
+
+     g rw_na_lc_perf=max(max(rcfd3821, rcon3821), rcfdd997, rcond997)
+     g rw_ea_lc_perf=max(max(rcfdb650, rconb650), rcfdd998, rcond998)
+     g rw00_lc_perf=max(max(rcfdb651, rconb651), rcfdd999, rcond999)
+     g rw20_lc_perf=max(max(rcfdb652, rconb652), rcfdg603, rcong603)
+     g rw50_lc_perf=max(max(rcfdb653, rconb653),rcfdg604, rcong604)
+     g rw100_lc_perf=max(max(rcfdb654, rconb654), rcfdg605, rcong605)
+
+     g rw_na_lc_com=max(max(rcfd3411, rcon3411), rcfdg606, rcong606)
+     g rw_ea_lc_com=max(max(rcfdb655, rconb655), rcfdg607, rcong607)
+     g rw00_lc_com=max(max(rcfdb656, rconb656), rcfdg608, rcong608)
+     g rw20_lc_com=max(max(rcfdb657, rconb657), rcfdg609, rcong609)
+     g rw50_lc_com=max(max(rcfdb658, rconb658), rcfdg610, rcong610)
+     g rw100_lc_com=max(max(rcfdb659, rconb659), rcfdg611, rcong611)
+
+     g rw_na_banker_acpt=max(rcfd3429, rcon3429)
+     g rw_ea_banker_acpt=max(rcfdb660, rconb660)
+     g rw00_banker_acpt=max(rcfdb661, rconb661)
+     g rw20_banker_acpt=max(rcfdb662, rconb662)
+     g rw100_banker_acpt=max(rcfdb663, rconb663)
+
+     g rw_na_recourse=max(max(rcfda250, rcona250)+max(rcfdb541, rconb541)+max(rcfdb675, rconb675),rcfdg612, rcong612)
+     g rw_ea_recourse=max(max(rcfdb669,rconb669)+max(rcfdb542, rconb542)+max(rcfdb676, rconb676),rcfdg613, rcong613)
+
+     g rw00_recourse=max(max(rcfdb670, rconb670)+max(rcfdb677, rconb677),rcfdg614,rcong614)
+
+     g rw20_recourse=max(max(rcfdb671, rconb671)+max(rcfdb678, rconb678), rcfdg615, rcong615)
+     g rw50_recourse=max(max(rcfdb672, rconb672)+max(rcfdb679, rconb679), rcfdg616, rcong616)
+     g rw100_recourse=max(max(rcfdb673,rconb673)+ max(rcfdb543, rconb543)+ max(rcfdb680, rconb680),rcfdg617, rcong617)
+
+     g rw_na_sec_lent=max(sec_lent, rcfds515, rcons515)
+     g rw_ea_sec_lent=max(max(rcfdb664, rconb664), rcfds516, rcons516)
+     g rw00_sec_lent=max( max(rcfdb665, rconb665), rcfds517, rcons517)
+     g rw20_sec_lent=max( max(rcfdb666, rconb666), rcfds518+ rcfds519+rcfds520, rcons518+ rcons519+ rcons520)
+     g rw50_sec_lent=max( max(rcfdb667, rconb667), rcfds521, rcons521)
+     g rw100_sec_lent=max( max(rcfdb668, rconb668), rcfds522, rcons522)
+
+     g rw_na_other_offb_liab=max( max(rcfdb681, rconb681), rcfdg618, rcong618)
+     g rw_ea_other_offb_liab=max( max(rcfdb682, rconb682), rcfdg619, rcong619)
+     g rw00_other_offb_liab=max( max(rcfdb683, rconb683), rcfdg620, rcong620)
+     g rw20_other_offb_liab=max( max(rcfdb684, rconb684), rcfdg621, rcong621)
+     g rw50_other_offb_liab=max( max(rcfdb685, rconb685), rcfdg622, rcong622)
+     g rw100_other_offb_liab=max( max(rcfdb686, rconb686), rcfdg623, rcong623)
+
+     g rw_na_uc_abcp_1y=max( max(rcfdg591, rcong591), rcfds525, rcons525)
+     g rw_ea_uc_abcp_1y=max( max(rcfdg592, rcong592), rcfds526, rcons526)
+
+     g rw00_uc_abcp_1y=max( max(rcfdg593, rcong593), rcfds527, rcons527)
+     g rw20_uc_abcp_1y=max( max(rcfdg594, rcong594), rcfds528, rcons528)
+     g rw50_uc_abcp_1y=max( max(rcfdg595, rcong595), rcfds529, rcons529)
+     g rw100_uc_abcp_1y=max( max(rcfdg596, rcong596), rcfds530, rcons530)
+
+     g rw_na_uc_gt_1y=max( max(rcfd3833, rcon3833), rcfdg624, rcong624)
+     g rw_ea_uc_gt_1y=max( max(rcfdb687, rconb687), rcfdg625, rcong625)
+     g rw00_uc_gt_1y=max( max(rcfdb688, rconb688), rcfdg626, rcong626)
+     g rw20_uc_gt_1y=max( max(rcfdb689, rconb689), rcfdg627, rcong627)
+     g rw50_uc_gt_1y=max( max(rcfdb690, rconb690), rcfdg628, rcong628)
+     g rw100_uc_gt_1y=max( max(rcfdb691, rconb691), rcfdg629, rcong629)
+
+
+	 * TBD;
+
+     g rw_ea_deriv=max(max(rcfda167, rcona167),rcfds542+rcfds549,rcons542+rcons549)
+
+     g rw00_deriv=max(max(rcfdb693, rconb693),rcfds543+rcfds550,rcons543+rcons550)
+
+     g rw20_deriv=max(max(rcfdb694, rconb694), ///
+                    rcfds544+ rcfds545+ rcfds551+ rcfds552+ rcfds554, ///
+                    rcons544+ rcons545+ rcons551+ rcons552+ rcons554)
+
+     g rw50_deriv=max(max(rcfdb695, rconb695), rcfds546+rcfds555, rcons546+rcons555)
+
+     g rw00_asset_offb=max(max(rcfdb696, rconb696), rcfdg630, rcong630)
+
+     g rw20_asset_offb=max(max(rcfdb697, rconb697), ///
+	                     rcfds558+ rcfds559+ rcfds560+ rcfdg631, ///
+	                     rcons558+ rcons559+ rcons560+ rcong631)
+
+     g rw50_asset_offb=max(max(rcfdb698, rconb698), rcfdg632, rcong632)
+     g rw100_asset_offb=max(max(rcfdb699, rconb699), rcfdg633, rcong633)
+
+     g rw20_rwa=max( max(rcfdb701, rconb701), ///
+	              rcfds569+ rcfds570+ rcfds571+ rcfdg635, ///
+	              rcons569+ rcons570+ rcons571+ rcong635)
+
+     g rw50_rwa=max(max(rcfdb702, rconb702), rcfdg636, rcong636)
+     g rw100_rwa=max(max(rcfdb703, rconb703), rcfdg637, rcong637)
+
+     * market risk equivalent asset;
+     g mr_ea=max(rcfd1651, rcon1651)
+
+     /* end: risk weighted asset */
+
+
+     /* start: lcr */
+     g hqla_lv1=  rw_cash+ ///                        /* cash */
+                  rw00_sec_htm+ ///                   /* 0% risk weighted security htm */
+                  rw00_sec_afs+ ///                   /* 0% risk weighted security afs */
+                  rw00_rev_repo                       /* 0% risk weighted reverse repo */
+
+     g hqla_lv2=  rw20_sec_htm+ ///                   /* 20% risk weighted security htm */
+                  rw20_sec_afs+ ///                   /* 20% risk weighted security afs */
+                  rw20_rev_repo+ ///                  /* 20% risk weighted reverse repo */
+                  rw100_rev_repo                      /* 100% risk weighted reverse repo */
+
+     * highly liquid asset definition;
+     g hqla=hqla_lv1+ min(0.667*hqla_lv1, 0.85*hqla_lv2)
+
+     * not sure if the net negative fair value is the cash outflow;
+     * need to consult with someone;
+
+     g cds_pos= max(rcfdc219, rconc219)+ max(rcfdc221, rconc221) 
+     g cds_neg= max(rcfdc220, rconc220)+ max(rcfdc222, rconc222) 
+     g cds_net= cds_neg+ (-1)*cds_pos 
+
+     * this is on other liabilities;
+     * derivatives with a negative fair valure for purpose other than trading;
+     g deri_pay= max(rcfdc012, rconc012) 
+
+     * this is on other asset;
+     * derivatives with a positive fair value for purpose other than trading;
+     g deri_recv= max(rcfdc010, rconc010) 
+
+     * here we calculated the gross possitive and negative value for derivatives;
+     * need more information to decide how to use them;
+     * pos: positive fair value;
+     * neg: negative fair value;
+     * trd: contract for trading purpose;
+     * ntrd: contract for non-trading purpose;
+     * int: interest rate contract;
+     * fx: foreign exchange congracts;
+     * eq: equity derivative;
+     * cmd: commodity and other contracts;
+
+     g deri_int_pos_trd=max(rcfd8733, rcon8733) 
+     g deri_int_neg_trd=max(rcfd8737, rcon8737)
+
+     g deri_fx_pos_trd=max(rcfd8734, rcon8734) 
+     g deri_fx_neg_trd=max(rcfd8738, rcon8738) 
+
+     g deri_eq_pos_trd=max(rcfd8735, rcon8735) 
+     g deri_eq_neg_trd=max(rcfd8739, rcon8739) 
+
+     g deri_cmd_pos_trd=max(rcfd8736, rcon8736) 
+     g deri_cmd_neg_trd=max(rcfd8740, rcon8740) 
+
+     g deri_int_pos_ntrd=max(rcfd8741, rcon8741)
+     g deri_int_neg_ntrd=max(rcfd8745, rcon8745) 
+
+     g deri_fx_pos_ntrd=max(rcfd8742, rcon8742) 
+     g deri_fx_neg_ntrd=max(rcfd8746, rcon8746) 
+
+     g deri_eq_pos_ntrd=max(rcfd8743, rcon8743) 
+     g deri_eq_neg_ntrd=max(rcfd8747, rcon8747)
+
+     g deri_cmd_pos_ntrd=max(rcfd8744, rcon8744)
+     g deri_cmd_neg_ntrd=max(rcfd8748, rcon8748)
+
+     /* end: lcr */	
+
+     g credit1=asset+ uc
+     g credit2=loan+ uc
+     g credit_re=re_loan+ uc_cre+ uc_he
+     g credit_cons=cons_loan+ uc_cons
+     g credit_ci=ci_loan+ uc_other
+     g credit_cre=cre_loan+ uc_cre
+     g credit_res=res_loan+ uc_he
+     g tla=sti+ sec_fv+ (-1)*pledged_sec
+     g ila=asset+ (-1)*tla
+
+     * step 3: construct income variables, which are year-to-date data, need to be convert to quarterly data;
+
+     * loan interest income, security interest income;
+     g loan_int=riad4010+ riad4065
+     g sec_int=max(0, riad4218, riadb488+ riadb489+ riad4060)
+     g int_inc=riad4107
+     g int_exp=riad4073
+     g net_int_inc=riad4074
+
+     * provision for loan and lease losses;
+     g llp=riad4230 
+
+     g ni_inc=riad4079
+     g ni_exp=riad4093
+
+     /* 1984-03-31 to 9999 */
+     g net_ni_inc=ni_inc+ (-1)*ni_exp
+
+     /* 1994-03-31 to 9999 */
+     g sec_gains= riad3521+ riad3196+ riad4091
+
+     /* 1996-03-31 to 9999 */
+     g trade_inc=riada220
+
+     /* 2001-03-31 to 9999 */
+     g sz_inc=riadb493
+
+     /* 1991-03-31 to 9999 */
+     g as_inc=riad5416+ riad5415+ riadb496
+
+
+     g trd_int_inc=riad8757
+     g trd_fx_inc=riad8758
+     g trd_eqty_inc=riad8759
+     g trd_cmdty_inc=riad8760
+     g trd_credit_inc=riadf186
+
+     g trd_cds_inc=riadc889
+     g ntrd_cds_inc=max(riadc890, riad8761+ riad8762+ riad8763)
+     g cds_loss=riada251
+
+     * regular income is the sum of total interest income and total non-interest income;
+     * regular expense is the sum of toal interest expense and total non-interest expense;
+
+     g reg_inc=int_inc+ ni_inc
+     g reg_exp=int_exp+ ni_exp
+
+     g inc_bta=riad4301
+     g inc_ba=riad4300
+     g inc_adjust=riad4320
+     g net_inc=riad4340
+
+
+     * deposit interst expenses;	
+
+     g deposit_cost=max( ///
+                           /* 1969 to 2000 */ ///
+                           riad4170, ///
+                           /* form 31, after 2001 */ ///
+                           riad4508+ riad0093+ riada517+ riada518+ riad4172, ///
+                           /* form 41, after 2001 */ ///
+                           riad4508+ riad0093+ riada517+ riada518)
+
+
+     g tdge100k_cost=riada517+ riad4174
+     g tdlt100k_cost=riada518+ riad4512
+     g saving_deposit_cost=riad0093+ riad4509+ riad4511
+     g trans_deposit_cost=riad4508
+
+     g other_bm_cost=riad4185
+     g salary=riad4135
+
+
+     * charge-off;
+     g co=riad4635
+     g recov=riad4605
+     g net_co=co+(-1)*recov
+
+	 * For different categories, sum(0, max(form031, form041));
+	 * form031 is for banks with both home and foreign offices;
+	 * form041 is for banks with domestic offices only;
+
+     * charge-off on commerical and industrial loan;
+	 g ci_co_031=riad4645+ riad4646
+     g ci_recov_031=riad4617+ riad4618
+
+	 g ci_co_041=riad4638
+     g ci_recov_041=riad4608
+
+	 g ci_co=max(ci_co_031, ci_co_041)
+	 g ci_recov=max(ci_recov_031, ci_recov_041)
+     g ci_net_co=ci_co+(-1)*ci_recov
+
+
+     * charge-off on consumer loan;
+
+     g cons_co_031=max(riadb514+ riadk129+ riadk205, riadb514+ riadb516, riad4656+riad4657, riad4639)
+     g cons_recov_031=max(riadb515+ riadk133+ riadk206, riadb515+riadb517, riad4666+riad4667, riad4609)
+
+     g cons_co_041=cons_co_031
+     g cons_recov_041=cons_recov_031
+
+	 g cons_co=max(cons_co_031, cons_co_041)
+	 g cons_recov=max(cons_recov_031, cons_recov_041)
+     g cons_net_co=cons_co+(-1)*cons_recov
+
+
+	 * charge-off on real estate loans;
+     g re_co_031=max( ///
+				   riadc891+ riadc893+ riad3584+ riad5411+ riadc234+ riadc235+ riad3588+ riadc895+ riadc897+ riadb512,  ///
+	               riad3582+ riad3584+ riad5411+ riadc234+ riadc235+ riad3588+ riad3590+ riadb512, ///
+	               riad3582+ riad3584+ riad5411+ riad5413+ riad3588+ riad3590+ riadb512, ///
+	               riad4651+ riad4652, riad4613)
+
+     g re_recov_031=max( ///
+				   riadc892+ riadc894+ riad3585+ riad5412+ riadc217+ riadc218+ riad3589+ riadc896+ riadc898+ riadb513, /// 
+	               riad3583+ riad3585+ riad5412+ riadc217+ riadc218+ riad3589+ riad3591+ riadb513, ///
+	               riad3583+ riad3585+ riad5412+ riad5414+ riad3589+ riad3591+ riadb513, ///
+	               riad4661+ riad4662, riad4616)
+
+     g re_co_041=re_co_031 
+	 g re_recov_041=re_recov_031 
+
+	 g re_co=max(re_co_031, re_co_041)
+	 g re_recov=max(re_recov_031, re_recov_041)
+     g re_net_co=re_co+ (-1)*re_recov
+
+
+
+     * charge-off on construction loan;
+     g const_co_031=max(riadc891+ riadc893,riad3582)
+
+     g const_recov_031=max(riadc892+riadc894,riad3583)
+     g const_co_041=const_co_031
+	 g const_recov_041=const_recov_031
+
+	 g const_co=max(const_co_031, const_co_041)
+	 g const_recov=max(const_recov_031, const_recov_041)
+     g const_net_co=const_co+ (-1)*const_recov
+
+
+     * charge off on residential loan;
+     g res_co_031=max(riad5411+ riadc234+ riadc235+ riad3588, ///
+	               riad5411+ riad5413+ riad3588, ///
+	               riad5449+ riad5451+ riad5453)
+
+     g res_recov_031=max(riad5412+ riadc217+ riadc218+ riad3589, riad5412+ riad5414+ riad3589)
+
+     g res_co_041=res_co_031
+	 g res_recov_041=res_recov_031
+
+	 g res_co=max(res_co_031, res_co_041)
+	 g res_recov=max(res_recov_031, res_recov_041)
+     g res_net_co=res_co+ (-1)*res_recov
+
+
+
+
+     * charge off on securitized loan;	
+
+     g sz_co=riadb747+ riadb748+ riadb749+ riadb750+ riadb751+ riadb752+ riadb753
+
+     g sz_recov=riadb754+ riadb755+ riadb756+ riadb757+ riadb758+ riadb759+ riadb760
+
+
+     /* because of the ambiguity in the guideline and the uncertainty of 
+        mapping call report categories to basel iii liquidity standard categories, 
+        we cansider three scenario: the baseline, optimistic and pessimistic scenarios
+        because of the bcbs guideline changes, we calculate two baseline versions, 
+        s0_lcr is baseline based on the 2010 guideline, 
+        s1_lcr is basedline based on the 2013 guideline
+        s2_lcr is optimstic caculation based on the 2013 guideline, 
+        s3_lcr is the pessimistic calculation based on the 2013 guideline
+        s4_lcr is the total liquid asset to short term liability ratio;
+        s1_nsfr is the baseline scenario version;
+        s2_nsfr is the optimistic scenario version;
+        s3_nsfr is the pessimistic scenario version;
+        s4_nsfr is the ratio of the sum of long-term liability and equity to long-term asset;
+     */
+
+     g s1_1m_q=1.0/3.0
+     g s2_1m_q=1.0/3.0
+     g s3_1m_q=0.8
+
+     g s1_1m_y=1.0/12.0
+     g s2_1m_y=1.0/12.0
+     g s3_1m_y=0.8
+
+     g s1_retail=0.5
+     g s2_retail=0.8
+     g s3_retail=0.2
+
+
+     replace uninsured_deposit=0 if missing(uninsured_deposit)
+
+     g uninsured_deposit_r=uninsured_deposit/asset
+     g uninsured_ratio=uninsured_deposit/deposit
+
+
+     g lcr_deri_outflow=  ///
+                   1.00*cds_neg+ ///
+			       1.00*deri_pay+ ///
+			       1.00*deri_int_neg_trd+ ///
+			       1.00*deri_fx_neg_trd+ ///
+			       1.00*deri_eq_neg_trd+ ///
+			       1.00*deri_cmd_neg_trd+ ///
+			       1.00*deri_int_neg_ntrd+ ///
+			       1.00*deri_fx_neg_ntrd+ ///
+			       1.00*deri_eq_neg_ntrd+ ///
+			       1.00*deri_cmd_neg_ntrd 
+              
+
+
+     g lcr_deri_inflow=  ///
+                     1.00*deri_recv+  ///
+                     1.00*cds_pos+ ///
+				     1.00*deri_int_pos_trd+ ///
+				     1.00*deri_fx_pos_trd+ ///
+				     1.00*deri_eq_pos_trd+ ///
+				     1.00*deri_cmd_pos_trd+ ///
+				     1.00*deri_int_pos_ntrd+ ///
+				     1.00*deri_fx_pos_ntrd+ ///
+				     1.00*deri_eq_pos_ntrd+ ///
+				     1.00*deri_cmd_pos_ntrd
+
+					 
+     g lcr_uc_outflow=  ///
+			       /* unused commitmment */ ///
+                   0.05*uc_he+ ///
+                   0.05*uc_ccard+ ///
+                   0.10*uc_cre+ ///
+	               1.00*uc_sec_uw+  ///
+                   1.00*uc_other+ ///
+			       /* letter of credit */ ///
+			       0.05*lc
+		       
+
+     /* the baseline scenario */
+
+     /* baseline calculation based on bcbs 2010 guideline */
+     /* cash outflow */
+     g s0_lcr_out_cf= ///
+               /* stable retail deposit */ ///
+               0.05*trans_deposit_ipb*(1-uninsured_ratio)*s1_retail+  ///
+               0.05*tdlt100k_3mp*s1_1m_q*(1-uninsured_ratio)+  ///
+               0.05*saving_deposit*(1-uninsured_ratio)*s1_retail+ ///
+ ///
+			   /* less stable retail deposit */ ///
+               0.10*trans_deposit_ipb*uninsured_ratio*s1_retail+  ///
+               0.10*tdlt100k_3mp*s1_1m_q*uninsured_ratio+  ///
+               0.10*saving_deposit*uninsured_ratio*s1_retail+ ///
+ ///
+			   /* stable operational deposit */ ///
+               0.05*trans_deposit_ipb*(1-uninsured_ratio)*(1-s1_retail)+  ///
+               0.05*trans_deposit_dgov*(1-uninsured_ratio)+  ///
+               0.05*trans_deposit_sgov*(1-uninsured_ratio)+  ///
+			   0.05*trans_deposit_dbank*(1-uninsured_ratio)+  ///
+			   0.05*trans_deposit_fbank*(1-uninsured_ratio)+  ///
+               0.05*trans_deposit_fgov*(1-uninsured_ratio)+  ///
+               0.05*fn_deposit*s1_1m_y*(1-uninsured_ratio)+  ///
+ ///
+			   /* less stable operational deposit */ ///
+               0.25*trans_deposit_ipb*uninsured_ratio*(1-s1_retail)+  ///
+               0.25*trans_deposit_dgov*uninsured_ratio+  ///
+               0.25*trans_deposit_sgov*uninsured_ratio+  ///
+			   0.25*trans_deposit_dbank*uninsured_ratio+  ///
+			   0.25*trans_deposit_fbank*uninsured_ratio+  ///
+               0.25*trans_deposit_fgov*uninsured_ratio+  ///
+               0.25*fn_deposit*s1_1m_y*uninsured_ratio+  ///
+ ///
+ ///
+			   /* stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.75*saving_deposit*(1-uninsured_ratio)*(1-s1_retail)+ ///
+               0.75*tdge100k_3mp*(1-uninsured_ratio)*s1_1m_q+  ///
+ ///
+			   /* less stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.75*saving_deposit*uninsured_ratio*(1-s1_retail)+ ///
+               0.75*tdge100k_3mp*uninsured_ratio*s1_1m_q+  ///
+ ///
+ ///
+			   /* secured lending backed by level 2 asset*/ ///
+               0.15*rw00_sec_lent+ ///
+               0.15*repo_sec+  ///
+               0.15*rw20_sec_lent+ /// 
+ ///
+			   /* all other secured funding transactions */  ///
+               1.00*repo_ffund+ ///
+               1.00*rw50_sec_lent+ /// 
+               1.00*rw100_sec_lent+ /// 
+ ///
+			   /* other liabilities */ ///
+               1.00*other_liab+ /// 
+               1.00*trading_liab+ ///
+               1.00*other_bm_1y*s1_1m_y+ ///
+ ///
+			   /* derivative */ ///
+               1.00*lcr_deri_outflow+ ///
+ ///
+			   /* unused commitmment */ ///
+               1.00*lcr_uc_outflow
+       
+
+
+     /* cash inflow */
+     g s0_lcr_in_cf= ///
+                 1.00*loan_1y*0.5/12+ /// 
+                 1.00*lcr_deri_inflow
+
+
+
+     /* net cash outflow */
+     g s0_lcr_net_cf=s0_lcr_out_cf+ (-1)*min(0.75*s0_lcr_out_cf, s0_lcr_in_cf)
+
+
+     /* baseline calculation based on bcbs 2013 guideline */
+     /* cash outflow */
+     g s1_lcr_out_cf= ///
+               /* stable retail deposit */ ///
+               0.03*trans_deposit_ipb*(1-uninsured_ratio)*s1_retail+ /// 
+               0.03*tdlt100k_3mp*s1_1m_q*(1-uninsured_ratio)+ ///
+               0.03*saving_deposit*(1-uninsured_ratio)*s1_retail+ ///
+ ///
+			   /* less stable retail deposit */ ///
+               0.10*trans_deposit_ipb*uninsured_ratio*s1_retail+ /// 
+               0.10*tdlt100k_3mp*s1_1m_q*uninsured_ratio+ /// 
+               0.10*saving_deposit*uninsured_ratio*s1_retail+ ///
+ ///
+			   /* stable operational deposit */ ///
+               0.05*trans_deposit_ipb*(1-uninsured_ratio)*(1-s1_retail)+ /// 
+               0.05*trans_deposit_dgov*(1-uninsured_ratio)+ /// 
+               0.05*trans_deposit_sgov*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_dbank*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_fbank*(1-uninsured_ratio)+ /// 
+               0.05*trans_deposit_fgov*(1-uninsured_ratio)+ /// 
+               0.05*fn_deposit*s1_1m_y*(1-uninsured_ratio)+ /// 
+ ///
+			   /* less stable operational deposit */ ///
+               0.25*trans_deposit_ipb*uninsured_ratio*(1-s1_retail)+ /// 
+               0.25*trans_deposit_dgov*uninsured_ratio+ /// 
+               0.25*trans_deposit_sgov*uninsured_ratio+ /// 
+			   0.25*trans_deposit_dbank*uninsured_ratio+ /// 
+			   0.25*trans_deposit_fbank*uninsured_ratio+ /// 
+               0.25*trans_deposit_fgov*uninsured_ratio+ /// 
+               0.25*fn_deposit*s1_1m_y*uninsured_ratio+ /// 
+ ///
+ ///
+			   /* stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.20*saving_deposit*(1-uninsured_ratio)*(1-s1_retail)+ ///
+               0.20*tdge100k_3mp*(1-uninsured_ratio)*s1_1m_q+ ///
+ ///
+			   /* less stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.40*saving_deposit*uninsured_ratio*(1-s1_retail)+ ///
+               0.40*tdge100k_3mp*uninsured_ratio*s1_1m_q+ ///
+ ///
+ ///
+			   /* secured lending backed by level 2 asset*/ ///
+               0.15*rw00_sec_lent+ ///
+               0.15*repo_sec+ /// 
+               0.15*rw20_sec_lent+ /// 
+ ///
+			   /* all other secured funding transactions */ ///
+               1.00*repo_ffund+ /// 
+               1.00*rw50_sec_lent+ /// 
+               1.00*rw100_sec_lent+ /// 
+ ///
+			   /* other liabilities */ ///
+               1.00*other_liab+ /// 
+               1.00*trading_liab+ ///
+               1.00*other_bm_1y*s1_1m_y+ ///
+ ///
+			   /* derivative */ ///
+               1.00*lcr_deri_outflow+ ///
+ ///
+			   /* unused commitmment */ ///
+               1.00*lcr_uc_outflow
+             
+
+
+
+
+     /* cash inflow */
+     g s1_lcr_in_cf= ///
+                 1.00*loan_1y*0.5/12+ /// 
+                 1.00*lcr_deri_inflow
+             
+
+     /* net cash outflow */
+     g s1_lcr_net_cf=s1_lcr_out_cf+ (-1)*min(0.75*s1_lcr_out_cf, s1_lcr_in_cf)
+
+
+     /* the optimistic scenario based on 2013 guideline */
+
+     /* cash outflow */
+
+     g s2_lcr_out_cf= ///
+               /* stable retail deposit */ ///
+               0.03*trans_deposit_ipb*(1-uninsured_ratio)*s2_retail+ /// 
+               0.03*tdlt100k_3mp*s2_1m_q*(1-uninsured_ratio)+ /// 
+               0.03*saving_deposit*(1-uninsured_ratio)*s2_retail+ ///
+ ///
+			   /* less stable retail deposit */ ///
+               0.10*trans_deposit_ipb*uninsured_ratio*s2_retail+ ///
+               0.10*tdlt100k_3mp*s2_1m_q*uninsured_ratio+ ///
+               0.10*saving_deposit*uninsured_ratio*s2_retail+ ///
+ ///
+			   /* stable operational deposit */ ///
+               0.05*trans_deposit_ipb*(1-uninsured_ratio)*(1-s2_retail)+ /// 
+               0.05*trans_deposit_dgov*(1-uninsured_ratio)+ ///
+               0.05*trans_deposit_sgov*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_dbank*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_fbank*(1-uninsured_ratio)+ /// 
+               0.05*trans_deposit_fgov*(1-uninsured_ratio)+ /// 
+               0.05*fn_deposit*s2_1m_y*(1-uninsured_ratio)+ /// 
+ ///
+			   /* less stable operational deposit */ ///
+               0.25*trans_deposit_ipb*uninsured_ratio*(1-s2_retail)+ ///
+               0.25*trans_deposit_dgov*uninsured_ratio+ /// 
+               0.25*trans_deposit_sgov*uninsured_ratio+ /// 
+			   0.25*trans_deposit_dbank*uninsured_ratio+ /// 
+			   0.25*trans_deposit_fbank*uninsured_ratio+ /// 
+               0.25*trans_deposit_fgov*uninsured_ratio+ /// 
+               0.25*fn_deposit*s2_1m_y*uninsured_ratio+ /// 
+ ///
+ ///
+			   /* stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.20*saving_deposit*(1-uninsured_ratio)*(1-s2_retail)+ ///
+               0.20*tdge100k_3mp*(1-uninsured_ratio)*s2_1m_q+ /// 
+ ///
+			   /* less stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.40*saving_deposit*uninsured_ratio*(1-s2_retail)+ ///
+               0.40*tdge100k_3mp*uninsured_ratio*s2_1m_q+ /// 
+ ///
+ ///
+			   /* secured lending backed by level 2 asset*/ ///
+               0.15*rw00_sec_lent+ ///
+               0.15*repo_sec+  ///
+               0.15*rw20_sec_lent+ /// 
+ ///
+			   /* all other secured funding transactions */ ///
+               1.00*repo_ffund+ /// 
+               1.00*rw50_sec_lent+ /// 
+               1.00*rw100_sec_lent+ /// 
+ ///
+			   /* other liabilities */ ///
+               1.00*other_liab+ /// 
+               1.00*trading_liab+ ///
+               1.00*other_bm_1y*s2_1m_y+ ///
+ ///
+			   /* derivative */ ///
+               1.00*lcr_deri_outflow+ ///
+ ///
+			   /* unused commitmment */ ///
+               1.00*lcr_uc_outflow 
+			   
+
+     /* cash inflow */
+     g s2_lcr_in_cf= ///
+                 1.00*loan_1y*0.5/12+ /// 
+                 1.00*lcr_deri_inflow
+         
+
+     /* net cash outflow */
+     g s2_lcr_net_cf=s2_lcr_out_cf+(-1)*min(0.75*s2_lcr_out_cf, s2_lcr_in_cf)
+
+
+
+
+     /* the pessimistic scenario based on 2013 guideline */
+
+     g s3_lcr_out_cf= ///
+               /* stable retail deposit */ ///
+               0.03*trans_deposit_ipb*(1-uninsured_ratio)*s3_retail+ /// 
+               0.03*tdlt100k_3mp*s3_1m_q*(1-uninsured_ratio)+ ///
+               0.03*saving_deposit*(1-uninsured_ratio)*s3_retail+ ///
+ ///
+			   /* less stable retail deposit */ ///
+               0.10*trans_deposit_ipb*uninsured_ratio*s3_retail+ /// 
+               0.10*tdlt100k_3mp*s3_1m_q*uninsured_ratio+ /// 
+               0.10*saving_deposit*uninsured_ratio*s3_retail+ ///
+ ///
+			   /* stable operational deposit */ ///
+               0.05*trans_deposit_ipb*(1-uninsured_ratio)*(1-s3_retail)+ /// 
+               0.05*trans_deposit_dgov*(1-uninsured_ratio)+ /// 
+               0.05*trans_deposit_sgov*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_dbank*(1-uninsured_ratio)+ /// 
+			   0.05*trans_deposit_fbank*(1-uninsured_ratio)+ /// 
+               0.05*trans_deposit_fgov*(1-uninsured_ratio)+ /// 
+               0.05*fn_deposit*s3_1m_y*(1-uninsured_ratio)+ /// 
+ ///
+			   /* less stable operational deposit */ ///
+               0.25*trans_deposit_ipb*uninsured_ratio*(1-s3_retail)+ /// 
+               0.25*trans_deposit_dgov*uninsured_ratio+ /// 
+               0.25*trans_deposit_sgov*uninsured_ratio+ /// 
+			   0.25*trans_deposit_dbank*uninsured_ratio+ /// 
+			   0.25*trans_deposit_fbank*uninsured_ratio+ /// 
+               0.25*trans_deposit_fgov*uninsured_ratio+ /// 
+               0.25*fn_deposit*s3_1m_y*uninsured_ratio+ /// 
+ ///
+ ///
+			   /* stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.20*saving_deposit*(1-uninsured_ratio)*(1-s3_retail)+ ///
+               0.20*tdge100k_3mp*(1-uninsured_ratio)*s3_1m_q+ /// 
+ ///
+			   /* less stable non-financial corporate, sovereigns, central banks, pse */ ///
+               0.40*saving_deposit*uninsured_ratio*(1-s3_retail)+ ///
+               0.40*tdge100k_3mp*uninsured_ratio*s3_1m_q+ /// 
+ ///
+ ///
+			   /* secured lending backed by level 2 asset*/ ///
+               0.15*rw00_sec_lent+ ///
+               0.15*repo_sec+ /// 
+               0.15*rw20_sec_lent+ /// 
+ ///
+			   /* all other secured funding transactions */ ///
+               1.00*repo_ffund+ /// 
+               1.00*rw50_sec_lent+ /// 
+               1.00*rw100_sec_lent+ /// 
+ ///
+			   /* other liabilities */ ///
+               1.00*other_liab+ /// 
+               1.00*trading_liab+ ///
+               1.00*other_bm_1y*s3_1m_y+ ///
+ ///
+			   /* derivative */ ///
+               1.00*lcr_deri_outflow+ ///
+ ///
+			   /* unused commitmment */ ///
+               1.00*lcr_uc_outflow
+             
+
+
+
+     /* cash inflow */
+     g s3_lcr_in_cf= ///
+                 1.00*loan_1y*0.5/12+ /// 
+                 1.00*lcr_deri_inflow
+             
+
+     /* net cash outflow */
+     g s3_lcr_net_cf=s3_lcr_out_cf+ (-1)*min(0.75*s3_lcr_out_cf, s3_lcr_in_cf)
+
+
+     /* end: lcr */	
+
+     /* start: nsfr */
+
+
+     * rsf total;
+
+     g rsf= ///
+         0.05*uc+ ///                             /* unused commitment */
+         0.05*lc+ ///                              /* letter of credit */
+         0.05*rw00_sec_htm+ ///                    /* 0% risk weighted security htm */
+         0.05*rw00_sec_afs+ ///                    /* 0% risk weighted security afs */
+ /// 
+         0.20*rw20_sec_htm+ ///                    /* 20% risk weighted security htm */
+         0.20*rw20_sec_afs+ ///                     /* 20% risk weighted security afs */
+ /// 
+         0.50*rw50_sec_htm+ /// 
+         0.50*rw50_sec_afs+ /// 
+         0.50*rw00_loan+ /// 
+         0.50*rw00_trade_asset+ /// 
+         0.50*rw00_other_asset+ /// 
+ /// 
+         0.65*rw20_loan+ /// 
+         0.65*rw20_trade_asset+ /// 
+         0.65*rw20_other_asset+ /// 
+ /// 
+         0.85*rw50_loan+ /// 
+         0.85*rw50_trade_asset+ /// 
+         0.85*rw50_other_asset+ /// 
+ /// 
+         rw_sec_htm+  (-1)*rw00_sec_htm+  (-1)*rw20_sec_htm+  (-1)*rw50_sec_htm+ /// 
+         rw_sec_afs+  (-1)*rw00_sec_afs+  (-1)*rw20_sec_afs+  (-1)*rw50_sec_afs+ /// 
+         rw_loan+  (-1)*rw00_loan+  (-1)*rw20_loan+  (-1)*rw50_loan+ /// 
+         rw_trade_asset+  (-1)*rw00_trade_asset+  (-1)*rw20_trade_asset+  (-1)*rw50_trade_asset+ /// 
+         rw_other_asset+  (-1)*rw00_other_asset+  (-1)*rw20_other_asset+  (-1)*rw50_other_asset 
+     
+
+
+
+     /* baseline scenario */
+
+
+
+     g s0_asf= ///
+           1.00*( ///	
+                t1_capital+   ///                     			/* tier 1 capital  */
+                t2_capital+    ///                    			/* tier 2 capital */
+                time_deposit+     ///              			    /* time deposit */
+                (-1)*time_deposit_1y+    ///       		        /* time deposit less than 1 year   */
+                other_bm+       ///                 			/* other borrowed money */
+                (-1)*other_bm_1y)+        ///         			/* other borrowed money less than 1 year */
+ ///          
+           0.90*( ///
+               trans_deposit_ipb*s1_retail*(1-uninsured_ratio)+  ///	/* stable retail transaction deposit, ipb */
+               time_deposit_small_1y*(1-uninsured_ratio)+     ///      /* stable small time deposit less than 1 year */ 
+               saving_deposit*s1_retail*(1-uninsured_ratio))+    ///     /* stable retail saving deposit: mmda and other saving */     
+ ///       
+           0.80*( ///
+               trans_deposit_ipb*s1_retail*uninsured_ratio+ /// /* less stable retail transaction deposit, ipb */
+               time_deposit_small_1y*uninsured_ratio+  ///      /* stable small time deposit less than 1 year */ 
+               saving_deposit*s1_retail*uninsured_ratio)+ ///    /* less stable retail saving deposit: mmda and other saving */        
+ ///
+           0.5*( ///
+               trans_deposit_ipb*(1-s1_retail)+ ///             /* wholesale transaction deposit */
+               saving_deposit*(1-s1_retail)+ ///                /* wholesale saving deposit */
+               time_deposit_large_1y+ ///            		     /* large time deposit less than 1 year */
+               fn_deposit+ ///                       		     /* foreign deposit */
+               other_bm_1y+ ///                                  /* other borrowed money less than 1 year */
+               trans_deposit_dgov+ ///                          /* goverment transaction deposit */
+               trans_deposit_sgov+ ///                          /* state goverment transaction deposit */
+               trans_deposit_fgov+ ///                          /* foreign government transaction deposit */
+			   trans_deposit_dbank+ /// 
+			   trans_deposit_fbank)
+
+
+
+     g s1_asf= ///
+           1.00*(  /// 
+                t1_capital+ ///                        			/* tier 1 capital  */
+                t2_capital+ ///                        			/* tier 2 capital */
+                time_deposit+ ///                   			    /* time deposit */
+                (-1)*time_deposit_1y+ ///           		        /* time deposit less than 1 year   */
+                other_bm+ ///                        			/* other borrowed money */
+                (-1)*other_bm_1y)+ ///               			/* other borrowed money less than 1 year */
+ /// 
+           0.95*( ///                 
+               trans_deposit_ipb*s1_retail*(1-uninsured_ratio)+ ///  	/* stable retail transaction deposit, ipb */
+               time_deposit_small_1y*(1-uninsured_ratio)+ ///           /* stable small time deposit less than 1 year */ 
+               saving_deposit*s1_retail*(1-uninsured_ratio))+ ///         /* stable retail saving deposit: mmda and other saving */     
+ /// 
+           0.90*( /// 
+               trans_deposit_ipb*s1_retail*uninsured_ratio+ ///   /* less stable retail transaction deposit, ipb */
+               time_deposit_small_1y*uninsured_ratio+ ///         /* stable small time deposit less than 1 year */ 
+               saving_deposit*s1_retail*uninsured_ratio)+ ///       /* less stable retail saving deposit: mmda and other saving */        
+ ///  
+           0.5*( /// 
+               trans_deposit_ipb*(1-s1_retail)+ ///              /* wholesale transaction deposit */
+               saving_deposit*(1-s1_retail)+ ///                 /* wholesale saving deposit */
+               time_deposit_large_1y+ ///             		     /* large time deposit less than 1 year */
+               fn_deposit+ ///                        		     /* foreign deposit */
+               other_bm_1y+ ///                                   /* other borrowed money less than 1 year */
+               trans_deposit_dgov+ ///                           /* goverment transaction deposit */
+               trans_deposit_sgov+ ///                           /* state goverment transaction deposit */
+               trans_deposit_fgov+ ///                           /* foreign government transaction deposit */
+			   trans_deposit_dbank+ ///  
+			   trans_deposit_fbank)
+
+
+     /* optimstic scenario */
+     g s2_asf= /// 
+           1.00*( /// 
+                t1_capital+ ///                        			/* tier 1 capital  */
+                t2_capital+ ///                        			/* tier 2 capital */
+                time_deposit+ ///                   			    /* time deposit */
+                (-1)*time_deposit_1y+ ///           		        /* time deposit less than 1 year   */
+                other_bm+ ///                        			/* other borrowed money */
+                (-1)*other_bm_1y)+ ///                 			/* other borrowed money less than 1 year */
+ /// 
+           0.95*( ///               
+               trans_deposit_ipb*s2_retail*(1-uninsured_ratio)+ ///  	/* stable retail transaction deposit, ipb */
+               time_deposit_small_1y*(1-uninsured_ratio)+ ///           /* stable small time deposit less than 1 year */ 
+               saving_deposit*s2_retail*(1-uninsured_ratio))+ ///         /* stable retail saving deposit: mmda and other saving */     
+ /// 
+           0.90*( /// 
+               trans_deposit_ipb*s2_retail*uninsured_ratio+ ///   /* less stable retail transaction deposit, ipb */
+               time_deposit_small_1y*uninsured_ratio+ ///         /* stable small time deposit less than 1 year */ 
+               saving_deposit*s2_retail*uninsured_ratio)+ ///       /* less stable retail saving deposit: mmda and other saving */        
+ /// 
+           0.5*( /// 
+               trans_deposit_ipb*(1-s2_retail)+ ///              /* wholesale transaction deposit */
+               saving_deposit*(1-s2_retail)+ ///                 /* wholesale saving deposit */
+               time_deposit_large_1y+ ///             		     /* large time deposit less than 1 year */
+               fn_deposit+ ///                        		     /* foreign deposit */
+               other_bm_1y+ ///                                   /* other borrowed money less than 1 year */
+               trans_deposit_dgov+ ///                           /* goverment transaction deposit */
+               trans_deposit_sgov+ ///                           /* state goverment transaction deposit */
+               trans_deposit_fgov+ ///                           /* foreign government transaction deposit */
+			   trans_deposit_dbank+ ///  
+			   trans_deposit_fbank) 
+
+
+     /* pessimistic scenario */
+     g s3_asf= /// 
+           1.00*( /// 
+                t1_capital+ ///                        			/* tier 1 capital  */
+                t2_capital+ ///                        			/* tier 2 capital */
+                time_deposit+ ///                   			    /* time deposit */
+                (-1)*time_deposit_1y+ ///           		        /* time deposit less than 1 year   */
+                other_bm+ ///                        			/* other borrowed money */
+                (-1)*other_bm_1y)+ ///                 			/* other borrowed money less than 1 year */
+ /// 
+           0.95*( ///                 
+               trans_deposit_ipb*s3_retail*(1-uninsured_ratio)+ ///  	/* stable retail transaction deposit, ipb */
+               time_deposit_small_1y*(1-uninsured_ratio)+ ///           /* stable small time deposit less than 1 year */ 
+               saving_deposit*s3_retail*(1-uninsured_ratio))+ ///         /* stable retail saving deposit: mmda and other saving */     
+ /// 
+           0.90*( /// 
+               trans_deposit_ipb*s3_retail*uninsured_ratio+ ///   /* less stable retail transaction deposit, ipb */
+               time_deposit_small_1y*uninsured_ratio+ ///         /* stable small time deposit less than 1 year */ 
+               saving_deposit*s3_retail*uninsured_ratio)+ ///       /* less stable retail saving deposit: mmda and other saving */        
+ /// 
+           0.5*( /// 
+               trans_deposit_ipb*(1-s3_retail)+ ///              /* wholesale transaction deposit */
+               saving_deposit*(1-s3_retail)+ ///                 /* wholesale saving deposit */
+               time_deposit_large_1y+ ///             		     /* large time deposit less than 1 year */
+               fn_deposit+ ///                        		     /* foreign deposit */
+               other_bm_1y+ ///                                   /* other borrowed money less than 1 year */
+               trans_deposit_dgov+ ///                           /* goverment transaction deposit */
+               trans_deposit_sgov+ ///                           /* state goverment transaction deposit */
+               trans_deposit_fgov+ ///                           /* foreign government transaction deposit */
+			   trans_deposit_dbank+ ///  
+			   trans_deposit_fbank)
+
+
+
+     /* end nsfr */	
+
+
+      gen year=year(date)
+      g s0_lcr_gap=s0_lcr_net_cf+(-1)*hqla if hqla>0 & s0_lcr_net_cf>0 & year>=2001
+      g s1_lcr_gap=s1_lcr_net_cf+(-1)*hqla if hqla>0 & s1_lcr_net_cf>0 & year>=2001
+      g s2_lcr_gap=s2_lcr_net_cf+(-1)*hqla if hqla>0 & s2_lcr_net_cf>0 & year>=2001
+      g s3_lcr_gap=s3_lcr_net_cf+(-1)*hqla if hqla>0 & s3_lcr_net_cf>0 & year>=2001
+
+      g s0_nsfr_gap=rsf+ (-1)*s0_asf if rsf>0 & s0_asf>0  & year>=2001
+      g s1_nsfr_gap=rsf+ (-1)*s1_asf if rsf>0 & s1_asf>0  & year>=2001
+      g s2_nsfr_gap=rsf+ (-1)*s2_asf if rsf>0 & s2_asf>0  & year>=2001
+      g s3_nsfr_gap=rsf+ (-1)*s3_asf if rsf>0 & s3_asf>0  & year>=2001
+
+
+
+     g lcr_deri_outflow_r=lcr_deri_outflow/asset
+     g lcr_deri_inflow_r=lcr_deri_inflow/asset
+	 g lcr_deri_netflow_r=lcr_deri_outflow_r+ (-1)*lcr_deri_inflow_r
+     g lcr_uc_outflow_r=lcr_uc_outflow/asset 
+
+     g s4_lcr=tla/stl if stl>0 
+     //g s4_nsfr=(ltl+equity)/lta if lta>0 
+
+     * topcode type: 0-normal, 1-missing, 2-miss high, 3-miss low;
+     g toptype=0
+
+	 
+	    g s0_lcr=hqla/s0_lcr_net_cf if s0_lcr_net_cf>0 & year>=2001
+	    g s1_lcr=hqla/s1_lcr_net_cf if s1_lcr_net_cf>0 & year>=2001
+	    g s2_lcr=hqla/s2_lcr_net_cf if s2_lcr_net_cf>0 & year>=2001
+	    g s3_lcr=hqla/s3_lcr_net_cf if s3_lcr_net_cf>0 & year>=2001
+
+        g hqla_r=hqla/asset if year>=2001
+        g s0_lcr_net_cf_r=s0_lcr_net_cf/asset if year>=2001
+        g s1_lcr_net_cf_r=s1_lcr_net_cf/asset if year>=2001
+        g s2_lcr_net_cf_r=s2_lcr_net_cf/asset if year>=2001
+        g s3_lcr_net_cf_r=s3_lcr_net_cf/asset if year>=2001
+
+        g s0_lcr_gap_r=s0_lcr_gap/asset if year>=2001
+        g s1_lcr_gap_r=s1_lcr_gap/asset if year>=2001
+        g s2_lcr_gap_r=s2_lcr_gap/asset if year>=2001
+        g s3_lcr_gap_r=s3_lcr_gap/asset if year>=2001
+
+        g s0_nsfr=s0_asf/rsf if rsf>0 & year>=2001 
+        g s1_nsfr=s1_asf/rsf if rsf>0 & year>=2001 
+        g s2_nsfr=s2_asf/rsf if rsf>0 & year>=2001 
+        g s3_nsfr=s3_asf/rsf if rsf>0 & year>=2001 
+
+        g rsf_r=rsf/asset if year>=2001
+        g s0_asf_r=s0_asf/asset if year>=2001
+        g s1_asf_r=s1_asf/asset if year>=2001
+        g s2_asf_r=s2_asf/asset if year>=2001
+        g s3_asf_r=s3_asf/asset if year>=2001
+
+        g s0_nsfr_gap_r=s0_nsfr_gap/asset if year>=2001
+        g s1_nsfr_gap_r=s1_nsfr_gap/asset if year>=2001
+        g s2_nsfr_gap_r=s2_nsfr_gap/asset if year>=2001
+        g s3_nsfr_gap_r=s3_nsfr_gap/asset if year>=2001
+
+        g hqla_lv1_r=hqla_lv1/asset if year>=2001				/* level 1 asset */
+        g hqla_lv2_r=hqla_lv2/asset if year>=2001				/* level 2 asset */
+
+		g s0_lcr_gap2=max(0, s0_lcr_gap) if year>=2001
+		g s1_lcr_gap2=max(0, s1_lcr_gap) if year>=2001
+		g s2_lcr_gap2=max(0, s2_lcr_gap) if year>=2001
+		g s3_lcr_gap2=max(0, s3_lcr_gap) if year>=2001
+
+		g s0_lcr_gap3=max(0, (-1)*s0_lcr_gap) if year>=2001
+		g s1_lcr_gap3=max(0, (-1)*s1_lcr_gap) if year>=2001
+		g s2_lcr_gap3=max(0, (-1)*s2_lcr_gap) if year>=2001
+		g s3_lcr_gap3=max(0, (-1)*s3_lcr_gap) if year>=2001
+
+		g s0_nsfr_gap2=max(0, s0_nsfr_gap) if year>=2001
+		g s1_nsfr_gap2=max(0, s1_nsfr_gap) if year>=2001
+		g s2_nsfr_gap2=max(0, s2_nsfr_gap) if year>=2001
+		g s3_nsfr_gap2=max(0, s3_nsfr_gap) if year>=2001
+
+		g s0_nsfr_gap3=max(0, (-1)*s0_nsfr_gap) if year>=2001
+		g s1_nsfr_gap3=max(0, (-1)*s1_nsfr_gap) if year>=2001
+		g s2_nsfr_gap3=max(0, (-1)*s2_nsfr_gap) if year>=2001
+        g s3_nsfr_gap3=max(0, (-1)*s3_nsfr_gap) if year>=2001 
+
+
+        g rw_cash_r=rw_cash/asset if year>=2001					/* cash */
+        g rw00_sec_htm_r=rw00_sec_htm/asset if year>=2001		    /* 0% risk weighted security htm */
+        g rw00_sec_afs_r=rw00_sec_afs/asset if year>=2001		    /* 0% risk weighted security afs */
+        g rw00_rev_repo_r=rw00_rev_repo/asset if year>=2001      /* 0% risk weighted reverse repo */
+        g rw20_sec_htm_r=rw20_sec_htm/asset if year>=2001         /* 20% risk weighted security htm */
+        g rw20_sec_afs_r=rw20_sec_afs/asset if year>=2001         /* 20% risk weighted security afs */
+        g rw20_rev_repo_r=rw20_rev_repo/asset if year>=2001       /* 20% risk weighted reverse repo */
+        g rw100_rev_repo_r=rw100_rev_repo/asset if year>=2001     /* 100% risk weighted reverse repo */
+
+        g l2_asset_r=l2_asset/asset if year>=2001
+        g l3_asset_r=l3_asset/asset if year>=2001
+
+        g l2_liab_r=l2_liab/asset if year>=2001
+        g l3_liab_r=l3_liab/asset if year>=2001	
+		}
+	****************************************
+
+}
+//******************************************************************************
+
+* Daheng: drop observations that don't make sense:
+drop if uninsured_ratio > 1 // 1 observation
+drop if rcong313 > asset // 1 observation, GSE mbs
+drop if loan > asset // 77 observations
+drop if rw00_sec_lent + repo_sec + rw20_sec_lent > liab //secured lending backed by level 2 asset, 188 observations
+drop if other_liab < 0 // 3 observations
+
+save "$folder\raw\interim\lcr_bhc_level.dta",replace
+
+
+
+
+
+
+
+
+
+
