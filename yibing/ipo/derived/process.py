@@ -55,3 +55,9 @@ def statistics(ts):
         'high': ts.max(),
         'low': ts.min()
     }
+
+def check_valid(data, summary, offline_data):
+    cur_data = merge_data(data, summary, ["IPOListDt"])
+    cur_data = merge_data(cur_data,  offline_data, ['OflBidLowLmtYuan', 'OflBidUpLmtYuan'])
+    cur_data['valid'] = cur_data['PRICE'].le(cur_data['OflBidUpLmtYuan']) & cur_data['PRICE'].ge(cur_data['OflBidLowLmtYuan'])
+    return cur_data

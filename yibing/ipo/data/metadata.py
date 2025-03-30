@@ -2405,3 +2405,22 @@ SUBSCRIPTION_RATIO_COLUMNS = {
     "网下发行有效申购倍数": "OflIssuedValidSubMultiple",
     "网下超额认购倍数": "OflOverSubMultiple"
 }
+
+
+UMDERWRITER_COLUMNS = {
+    "证券代码": "SecCode",
+    "证券简称": "SecAbbr",
+    "首发上市日期": "IPOListDt",
+    "首发发行方式": "IPOIssueMethod",       # 例如询价发行/定价发行
+    "首发承销方式": "IPOUndMethod",        # 包销/代销 (Underwriting Method)
+    "首发主承销商": "IPOLeadUW",           # Lead Underwriter
+    "首发保荐机构": "IPOSponsor",          # 保荐机构独立字段
+    "首发副主承销商": "IPOCoLeadUW",       # Co-Lead Underwriter
+    "首发分销商": "IPODistributor",        # 分销商实体
+    "首发国际协调人": "IPOIntlCoord",      # International Coordinator
+    "首发审计机构": "IPOAuditor",          # 审计机构名称
+    "首发保荐人代表": "IPOSponsorRep",     # 保荐代表人姓名
+    "首发签字会计师": "IPOSigningAcct",    # 签字会计师姓名
+    "首发经办律师": "IPOHandlingLawyer",   # 经办律师姓名
+    "首发经办律所": "IPOHandlingLawFirm"   # 经办律师事务所名称
+}

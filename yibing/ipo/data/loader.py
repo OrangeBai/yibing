@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
-from yibing.ipo.data.metadata import JQ_INFO, DS_INFO,SUMMARY_TABLE_COLMNS_MAP, GEM_OFFLINE_RAW_DATA_COLUMMNS_MAP, MEAN_TABEL_RENAME, SUMMARY2_TABLE, SUMMARY_TABLE_COLUMNS_MAP_REFRESH, SUBSCRIPTION_RATIO_COLUMNS
+from yibing.ipo.data.metadata import JQ_INFO, DS_INFO,SUMMARY_TABLE_COLMNS_MAP, GEM_OFFLINE_RAW_DATA_COLUMMNS_MAP, MEAN_TABEL_RENAME, SUMMARY2_TABLE, SUMMARY_TABLE_COLUMNS_MAP_REFRESH, SUBSCRIPTION_RATIO_COLUMNS, UMDERWRITER_COLUMNS
 import logging
 from tqdm import tqdm
 from yibing.utils.file_system import get_lib
@@ -129,5 +129,12 @@ def read_sub_ratio():
     data = data[data.SecCode.str.contains('.SZ')]
     return data.set_index('SecCode')
 
+
+def read_uw():
+    data = pd.read_excel('/mnt/f/Yibing/Data/_02IPO/summary/GEMIssueMethodAndUnderWritter.xlsx', engine='openpyxl').rename(columns=UMDERWRITER_COLUMNS)
+    data = data.dropna(thresh=1)
+    data = data[data.SecCode.str.contains('.SZ')]
+    data = data.set_index('SecCode')
+    return data
 # if __name__ == "__main__":
 #     refresh_data()
